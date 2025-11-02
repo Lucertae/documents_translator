@@ -46,12 +46,18 @@ python3 app/pdf_translator_gui.py
 
 ## 📋 Funzionalità
 
+### Core Translation
 - ✅ **Traduzione PDF** con preservazione layout perfetto
 - ✅ **2 Motori traduzione**: Google Translate (online) + Argos Translate (offline)
-- ✅ **OCR integrato**: Traduzione PDF scansionati con Tesseract
+- ✅ **OCR integrato**: Traduzione PDF scansionati con Tesseract, Dolphin, Chandra
 - ✅ **8 Metodi estrazione testo** + metodo ibrido intelligente
-- ✅ **GUI professionale** con menu, shortcuts, tooltips
 - ✅ **Batch processing**: Traduci cartelle intere di PDF
+
+### System Features
+- ✅ **Sistema Licenze**: Hardware binding e gestione licenze
+- ✅ **Security System**: Integrity checking, secure storage, anti-tampering
+- ✅ **Auto-Update**: Verifica aggiornamenti da GitHub Releases
+- ✅ **GUI professionale**: Menu, shortcuts, tooltips, tema moderno
 - ✅ **Multi-piattaforma**: Windows, macOS, Linux
 
 ---
@@ -97,9 +103,15 @@ python build.py
 python build_multi_platform.py
 ```
 
+### CI/CD
+- **GitHub Actions**: Build e release automatizzati
+- **Auto-Release**: Tag versione → Build → Release automatica
+- **Testing**: Test automatici su Windows, Linux, macOS
+
 ### Documentazione Sviluppo
 - Vedi `docs/internal/` per documentazione tecnica
 - Vedi `STRUTTURA_PROGETTO.md` per struttura dettagliata
+- Vedi `scripts/development/PRIMO_VERSIONING.md` per prima release
 
 ---
 

@@ -13,13 +13,19 @@ LAC_Translate/
 │   ├── pdf_translator_gui.py     # GUI principale
 │   ├── license_manager.py        # Sistema licenze
 │   ├── license_activation.py     # Dialog attivazione
+│   ├── license_tracker.py        # Tracking licenze vendute
 │   ├── settings_manager.py       # Gestione settings
 │   ├── settings_dialog.py         # Dialog settings
 │   ├── batch_processor.py        # Processamento batch
 │   ├── batch_dialog.py           # Dialog batch
 │   ├── generate_license.py       # Generazione chiavi
 │   ├── version.py                # Versioning
-│   └── setup_argos_models.py     # Setup modelli Argos
+│   ├── setup_argos_models.py     # Setup modelli Argos
+│   ├── integrity_checker.py      # Verifica integrità file
+│   ├── security_validator.py     # Validazione sicurezza
+│   ├── secure_storage.py         # Storage criptato
+│   ├── update_checker.py         # Controllo aggiornamenti
+│   └── update_downloader.py      # Download aggiornamenti
 │
 ├── scripts/                      # ✅ Script e utility
 │   ├── windows/                  # Script Windows (.bat, .ps1)
@@ -31,7 +37,14 @@ LAC_Translate/
 │   │
 │   ├── development/              # Script sviluppo
 │   │   ├── QUICK_TEST.bat
-│   │   └── REORGANIZZA_PROGETTO.bat
+│   │   ├── REORGANIZZA_PROGETTO.bat
+│   │   ├── generate_license_with_tracking.py  # Genera licenze con tracking
+│   │   ├── view_licenses.py                   # Visualizza licenze
+│   │   ├── create_integrity_manifest.py       # Genera manifest integrità
+│   │   ├── test_security.py                   # Test sistema sicurezza
+│   │   ├── generate_test_license.py          # Genera licenza test
+│   │   ├── primo_versioning.bat               # Script primo versioning
+│   │   └── PRIMO_VERSIONING.md                # Guida primo versioning
 │   │
 │   ├── INSTALL_MACOS.sh          # Installer macOS
 │   └── INSTALL_LINUX.sh          # Installer Linux
