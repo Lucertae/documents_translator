@@ -115,6 +115,13 @@ VERSION.json
 # version.json can be committed for releases (uncomment if needed)
 # version.json
 
+# Security files (CRITICAL - NEVER commit)
+security/.encryption_key
+security/secure_storage.json
+security/security_config.json
+security/file_manifest.json
+logs/security.log
+
 # Lock files (optional - decide if needed for chandra/)
 *.lock
 # uv.lock  # Uncomment if NOT committing lock files for chandra/

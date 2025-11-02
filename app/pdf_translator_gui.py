@@ -210,6 +210,9 @@ class PDFTranslatorGUI:
         self.is_translating = False
         self.update_translator_info()
         
+        # Security and integrity check
+        self.check_security_integrity()
+        
         # License check
         if LICENSE_AVAILABLE:
             self.license_manager = get_license_manager()
@@ -2323,6 +2326,35 @@ class PDFTranslatorGUI:
                 return False
         
         return True
+    
+    def check_security_integrity(self):
+        """Controlla sicurezza e integrità all'avvio"""
+        try:
+            from integrity_checker import IntegrityChecker
+            from security_validator import get_security_validator
+            
+            # Integrity check file critici
+            integrity_checker = IntegrityChecker(BASE_DIR)
+            integrity_ok = integrity_checker.check_critical_files()
+            
+            if not integrity_ok:
+                logging.warning("Integrity check found modified files - continuing anyway (non-strict mode)")
+            
+            # Security validation avanzata
+            security_validator = get_security_validator(BASE_DIR)
+            security_results = security_validator.perform_security_checks()
+            
+            if security_results['overall_status'] == 'WARNING':
+                warnings = security_results.get('warnings', [])
+                logging.warning(f"Security warnings detected: {', '.join(warnings)}")
+                
+                # In modalità produzione, potresti voler essere più strict
+                # Per ora solo logging
+            
+        except ImportError as e:
+            logging.debug(f"Security modules not available: {e}")
+        except Exception as e:
+            logging.error(f"Error during security check: {e}")
     
     def load_eula_text(self):
         """Carica testo EULA"""

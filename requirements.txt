@@ -26,6 +26,7 @@ deep-translator>=1.11.4
 
 # License system and security (required)
 cryptography>=41.0.0  # Encryption per sicurezza dati
+psutil>=5.9.0  # System information per security validation
 
 # Optional: Dolphin OCR dependencies (install manually if using Dolphin)
 # torch>=2.0.0  # Uncomment if using Dolphin OCR

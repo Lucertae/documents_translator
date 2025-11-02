@@ -235,7 +235,7 @@ class LicenseManager:
             return False, f"Errore durante il salvataggio della licenza: {str(e)}"
     
     def load_license(self):
-        """Carica licenza da file"""
+        """Carica licenza da file (con supporto secure storage)"""
         if not self.license_file.exists():
             logger.info("No license file found")
             return False
@@ -244,13 +244,30 @@ class LicenseManager:
             with open(self.license_file, 'r') as f:
                 self.license_data = json.load(f)
             
+            # Se serial_key è criptato, carica da secure storage
+            if self.license_data.get('serial_key') == '[ENCRYPTED]':
+                try:
+                    from secure_storage import SecureStorage
+                    secure_storage = SecureStorage()
+                    serial_key = secure_storage.load_secure_value('license_serial')
+                    
+                    if not serial_key:
+                        logger.error("Cannot decrypt license serial key from secure storage")
+                        return False
+                    
+                    self.license_data['serial_key'] = serial_key
+                except ImportError:
+                    logger.error("Secure storage not available but encrypted license found")
+                    return False
+            
+            serial_key = self.license_data.get('serial_key', '')
+            
             # Verifica binding hardware
             if self.license_data.get('hw_id') != self.hw_id:
                 logger.warning(f"Hardware ID mismatch: {self.license_data.get('hw_id')} != {self.hw_id}")
                 return False
             
             # Verifica hash licenza
-            serial_key = self.license_data.get('serial_key', '')
             expected_hash = self.generate_license_hash(serial_key, self.hw_id)
             if self.license_data.get('license_hash') != expected_hash:
                 logger.warning("License hash mismatch - possible tampering")
