@@ -2,7 +2,7 @@
 ; Crea installer Windows professionale
 
 #define MyAppName "LAC TRANSLATE"
-#define MyAppVersion "2.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "LAC Software"
 #define MyAppURL "https://www.lactranslate.com"
 #define MyAppExeName "LAC_Translate.exe"
@@ -26,7 +26,7 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=release\installer
 OutputBaseFilename=LAC_Translate_v{#MyAppVersion}_Setup
-SetupIconFile=logo_alt.ico
+SetupIconFile=resources\icons\logo_alt.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

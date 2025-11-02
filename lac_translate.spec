@@ -12,9 +12,9 @@ a = Analysis(
     binaries=[],
     datas=[
         ('app/deep_translator', 'deep_translator'),  # Include deep_translator module
-        ('app/ocr_manager.py', 'app'),  # Include OCR manager
         ('security', 'security'),  # Include security module
         ('resources/icons/logo_alt.ico', '.'),  # Include icon
+        ('security/file_manifest.json', 'security'),  # Include integrity manifest
     ],
     hiddenimports=[
         'tkinter',
@@ -35,12 +35,25 @@ a = Analysis(
         'ocr_manager',
         'security',
         'security.security_manager',
+        'security.__init__',
         'cryptography',
         'cryptography.fernet',
         'license_manager',
         'license_activation',
+        'license_tracker',
         'settings_manager',
         'settings_dialog',
+        'integrity_checker',
+        'security_validator',
+        'secure_storage',
+        'update_checker',
+        'update_downloader',
+        'batch_processor',
+        'batch_dialog',
+        'psutil',
+        'json',
+        'hashlib',
+        'base64',
     ],
     hookspath=[],
     hooksconfig={},
