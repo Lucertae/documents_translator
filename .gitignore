@@ -112,7 +112,8 @@ docs/internal/LICENZA_GITHUB_STRATEGY.md
 
 # Version files (generated)
 VERSION.json
-version.json
+# version.json can be committed for releases (uncomment if needed)
+# version.json
 
 # Lock files (optional - decide if needed for chandra/)
 *.lock
