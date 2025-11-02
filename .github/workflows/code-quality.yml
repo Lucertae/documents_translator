@@ -1,0 +1,38 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    name: Lint Python Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pylint
+      
+      - name: Run flake8
+        run: |
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=__pycache__,deep_translator
+          flake8 app/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=__pycache__,deep_translator
+        continue-on-error: true
+      
+      - name: Check for common issues
+        run: |
+          echo "Checking for common Python issues..."
+          python -m py_compile app/*.py || true
+

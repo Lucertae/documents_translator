@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Verify imports
+        run: |
+          python -c "import sys; sys.path.insert(0, 'app'); from pdf_translator_gui import PDFTranslatorGUI; print('✓ Import successful')"
+      
+      - name: Check version
+        run: |
+          python app/version.py
+          python -c "import sys; sys.path.insert(0, 'app'); from version import VERSION_STRING; print(f'Version: {VERSION_STRING}')"
+      
+      - name: Verify license system
+        run: |
+          python -c "import sys; sys.path.insert(0, 'app'); from license_manager import LicenseManager; lm = LicenseManager(); print(f'✓ License manager initialized, HW ID: {lm.hw_id[:8]}...')"
+      
+      - name: Verify update checker
+        run: |
+          python -c "import sys; sys.path.insert(0, 'app'); from update_checker import UpdateChecker; uc = UpdateChecker(); print(f'✓ Update checker initialized for version {uc.current_version}')"
+
