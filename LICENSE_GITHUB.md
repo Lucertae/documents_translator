@@ -45,6 +45,20 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 If you use any portion of this Software in your projects (subject to license terms), 
 please provide attribution to the original authors.
 
+## Third-Party Dependencies
+
+This Software uses open-source libraries with their respective licenses:
+
+- **PyMuPDF**: AGPL v3 - Source code availability satisfied by this public repository
+- **Pillow**: PIL License - Permissive, commercial use allowed
+- **Argos Translate**: MIT License - Permissive, commercial use allowed
+- **Deep Translator**: MIT License - Permissive, commercial use allowed
+- **Tesseract OCR**: Apache License 2.0 - Permissive, commercial use allowed
+- **Other dependencies**: Various permissive licenses (MIT, Apache, PIL)
+
+All dependencies are used in compliance with their respective licenses. The public 
+availability of this source code satisfies the AGPL v3 requirement for PyMuPDF.
+
 ---
 
 **This is proprietary software. Source code is visible in this repository for 
