@@ -5,14 +5,21 @@ Script per testare tutti i componenti sicurezza
 import sys
 from pathlib import Path
 
+# Aggiungi path per import
 BASE_DIR = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(BASE_DIR))
+sys.path.insert(0, str(BASE_DIR / "app"))
 
 def test_security_manager():
     """Test Security Manager"""
     print("Testing Security Manager...")
     try:
-        from security import get_security_manager
-        sm = get_security_manager()
+        # Import da cartella security/ (non app/)
+        security_path = BASE_DIR / "security"
+        if str(security_path) not in sys.path:
+            sys.path.insert(0, str(security_path))
+        from security_manager import SecurityManager
+        sm = SecurityManager(BASE_DIR)
         
         # Test encryption
         test_data = "test_secret_data_123"
@@ -42,7 +49,7 @@ def test_integrity_checker():
     """Test Integrity Checker"""
     print("Testing Integrity Checker...")
     try:
-        from app.integrity_checker import IntegrityChecker
+        from integrity_checker import IntegrityChecker
         ic = IntegrityChecker(BASE_DIR)
         
         # Check manifest exists
@@ -82,7 +89,7 @@ def test_security_validator():
     """Test Security Validator"""
     print("Testing Security Validator...")
     try:
-        from app.security_validator import get_security_validator
+        from security_validator import get_security_validator
         sv = get_security_validator(BASE_DIR)
         
         results = sv.perform_security_checks()
@@ -108,7 +115,7 @@ def test_secure_storage():
     """Test Secure Storage"""
     print("Testing Secure Storage...")
     try:
-        from app.secure_storage import SecureStorage
+        from secure_storage import SecureStorage
         ss = SecureStorage()
         
         # Test save/load

@@ -119,7 +119,7 @@ VERSION.json
 security/.encryption_key
 security/secure_storage.json
 security/security_config.json
-security/file_manifest.json
+# security/file_manifest.json  # Can be committed for releases (integrity checking)
 logs/security.log
 
 # Lock files (optional - decide if needed for chandra/)
