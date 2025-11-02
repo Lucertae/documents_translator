@@ -64,16 +64,36 @@ python3 app/pdf_translator_gui.py
 
 ## 📦 Installazione
 
+### Per Utenti Finali (Raccomandato)
+
+**Installazione Semplice - Nessuna Configurazione Tecnica Richiesta:**
+
+1. **Scarica installer** `LAC_Translate_v2.0.0_Setup.exe` dalla [GitHub Release](https://github.com/Lucertae/documents_translator/releases)
+2. **Esegui installer** (doppio click)
+3. **Segui wizard** di installazione
+4. **Avvia** dal desktop o menu Start
+5. **Inserisci** chiave seriale all'avvio
+
+✅ **Non serve installare Python** - tutto è incluso nell'installer!
+
 ### Requisiti
-- Python 3.8+
+- Windows 10/11 (64-bit)
 - 4GB RAM (8GB consigliato)
 - 2GB spazio disco
 
-### Windows
-1. Installa Python da [python.org](https://www.python.org/downloads/)
-2. Esegui: `scripts\windows\INSTALLA_DIPENDENZE.bat`
-3. Per OCR: `scripts\windows\INSTALLA_OCR.bat`
-4. Avvia: `scripts\windows\AVVIA_GUI.bat`
+### Per Sviluppatori (Sviluppo da Sorgenti)
+
+**Opzione 1: Script Automatico**
+```bash
+scripts\windows\INSTALLA_DIPENDENZE.bat
+scripts\windows\INSTALLA_OCR.bat
+scripts\windows\AVVIA_GUI.bat
+```
+
+**Opzione 2: Manuale**
+1. Installa Python 3.8+ da [python.org](https://www.python.org/downloads/)
+2. Installa dipendenze: `pip install -r requirements.txt`
+3. Avvia: `python app/pdf_translator_gui.py`
 
 ### macOS / Linux
 ```bash
