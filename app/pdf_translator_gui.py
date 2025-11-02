@@ -215,6 +215,9 @@ class PDFTranslatorGUI:
             self.license_manager = get_license_manager()
             self.check_license_on_startup()
         
+        # Auto-check updates on startup (optional, non-blocking)
+        self.check_updates_on_startup()
+        
         logging.info("LAC TRANSLATE started")
     
     def setup_style(self):
@@ -433,6 +436,8 @@ class PDFTranslatorGUI:
             help_menu.add_command(label="Informazioni Licenza", command=self.show_license_info)
             help_menu.add_command(label="Attiva Licenza...", command=self.activate_license_dialog)
             help_menu.add_separator()
+        help_menu.add_command(label="Verifica Aggiornamenti...", command=self.check_updates)
+        help_menu.add_separator()
         help_menu.add_command(label="Informazioni su LAC TRANSLATE", command=self.show_about)
         help_menu.add_command(label="Guida", command=self.show_help)
         
@@ -2479,6 +2484,299 @@ class PDFTranslatorGUI:
             "Per maggiori informazioni, consulta il manuale utente."
         )
         messagebox.showinfo("Guida", help_text)
+    
+    def check_updates(self):
+        """Controlla aggiornamenti disponibili"""
+        try:
+            from update_checker import UpdateChecker
+            from update_downloader import UpdateDownloader
+            import webbrowser
+            
+            self.update_status("Controllo aggiornamenti...", 'info')
+            
+            # Controlla in thread separato per non bloccare UI
+            def check_thread():
+                try:
+                    checker = UpdateChecker()
+                    update_info = checker.check_for_updates()
+                    
+                    # Esegui nella thread principale
+                    self.root.after(0, lambda: self.handle_update_result(update_info, checker))
+                except Exception as e:
+                    logging.error(f"Error checking updates: {e}")
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Errore", 
+                        f"Errore durante il controllo aggiornamenti:\n{str(e)}"
+                    ))
+            
+            # Avvia thread
+            threading.Thread(target=check_thread, daemon=True).start()
+            
+        except ImportError as e:
+            logging.error(f"Update checker not available: {e}")
+            messagebox.showerror("Errore", "Sistema aggiornamenti non disponibile")
+        except Exception as e:
+            logging.error(f"Error in check_updates: {e}")
+            messagebox.showerror("Errore", f"Errore imprevisto: {str(e)}")
+    
+    def handle_update_result(self, update_info, checker):
+        """Gestisce risultato controllo aggiornamenti"""
+        try:
+            from update_downloader import UpdateDownloader
+            import webbrowser
+            
+            if not update_info:
+                messagebox.showinfo(
+                    "Aggiornamenti", 
+                    "Impossibile verificare aggiornamenti.\n\nControlla la connessione internet."
+                )
+                self.update_status("", 'info')
+                return
+            
+            if update_info.get('available'):
+                # Aggiornamento disponibile
+                current = update_info['current_version']
+                latest = update_info['latest_version']
+                release_info = update_info['release_info']
+                
+                msg = (
+                    f"Nuova versione disponibile!\n\n"
+                    f"Versione corrente: {current}\n"
+                    f"Nuova versione: {latest}\n\n"
+                    f"Vuoi scaricare l'aggiornamento?"
+                )
+                
+                if messagebox.askyesno("Aggiornamento Disponibile", msg):
+                    # Opzione 1: Apri pagina GitHub Release
+                    release_url = release_info.get('html_url')
+                    if release_url:
+                        response = messagebox.askyesno(
+                            "Scarica Aggiornamento",
+                            "Vuoi aprire la pagina di download su GitHub?\n\n"
+                            "Da lì potrai scaricare l'installer più recente."
+                        )
+                        if response:
+                            webbrowser.open(release_url)
+                    
+                    # Opzione 2: Download automatico (se disponibile)
+                    downloader = UpdateDownloader()
+                    download_url = checker.get_download_url()
+                    
+                    if download_url:
+                        response2 = messagebox.askyesno(
+                            "Download Automatico",
+                            f"Vuoi scaricare automaticamente l'installer?\n\n"
+                            f"File: {download_url.split('/')[-1]}\n"
+                            f"Salvato in: downloads/"
+                        )
+                        if response2:
+                            self.download_update_file(download_url, downloader)
+            else:
+                # Già aggiornato
+                messagebox.showinfo(
+                    "Aggiornamenti", 
+                    f"Sei già alla versione più recente!\n\nVersione: {update_info.get('current_version', 'N/A')}"
+                )
+            
+            self.update_status("", 'info')
+            
+        except Exception as e:
+            logging.error(f"Error handling update result: {e}")
+            messagebox.showerror("Errore", f"Errore durante gestione aggiornamento: {str(e)}")
+    
+    def download_update_file(self, download_url, downloader):
+        """Scarica file aggiornamento con progress"""
+        try:
+            import tkinter.ttk as ttk
+            
+            # Crea dialog progress
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Download Aggiornamento")
+            progress_window.geometry("400x120")
+            progress_window.transient(self.root)
+            progress_window.grab_set()
+            
+            # Centra dialog
+            progress_window.update_idletasks()
+            x = (progress_window.winfo_screenwidth() // 2) - (400 // 2)
+            y = (progress_window.winfo_screenheight() // 2) - (120 // 2)
+            progress_window.geometry(f"400x120+{x}+{y}")
+            
+            # Label
+            label = tk.Label(
+                progress_window,
+                text="Download in corso...",
+                font=('Segoe UI', 10)
+            )
+            label.pack(pady=10)
+            
+            # Progress bar
+            progress_bar = ttk.Progressbar(
+                progress_window,
+                mode='indeterminate',
+                length=300
+            )
+            progress_bar.pack(pady=10)
+            progress_bar.start()
+            
+            # Status label
+            status_label = tk.Label(
+                progress_window,
+                text="Connessione...",
+                font=('Segoe UI', 9),
+                fg='gray'
+            )
+            status_label.pack()
+            
+            def update_progress(downloaded, total):
+                if total > 0:
+                    percent = (downloaded * 100) // total
+                    status_label.config(text=f"Scaricato: {downloaded // 1024} KB / {total // 1024} KB ({percent}%)")
+                else:
+                    status_label.config(text="Connessione...")
+            
+            def download_thread():
+                try:
+                    filename = download_url.split('/')[-1]
+                    status_label.config(text=f"Scaricando: {filename}...")
+                    
+                    file_path = downloader.download_update(
+                        download_url,
+                        filename=filename,
+                        progress_callback=update_progress
+                    )
+                    
+                    # Chiudi dialog e mostra risultato
+                    progress_window.after(0, lambda: self.handle_download_complete(file_path, downloader, progress_window))
+                    
+                except Exception as e:
+                    logging.error(f"Error downloading: {e}")
+                    progress_window.after(0, lambda: self.handle_download_error(str(e), progress_window))
+            
+            # Avvia download in thread
+            threading.Thread(target=download_thread, daemon=True).start()
+            
+        except Exception as e:
+            logging.error(f"Error creating download dialog: {e}")
+            messagebox.showerror("Errore", f"Errore durante download: {str(e)}")
+    
+    def handle_download_complete(self, file_path, downloader, progress_window):
+        """Gestisce completamento download"""
+        progress_window.destroy()
+        
+        if file_path and downloader.verify_download(file_path):
+            msg = (
+                f"Download completato!\n\n"
+                f"File: {file_path.name}\n"
+                f"Posizione: {file_path.parent}\n\n"
+                f"Vuoi aprire la cartella downloads?"
+            )
+            
+            if messagebox.askyesno("Download Completato", msg):
+                downloader.open_download_folder()
+                
+            messagebox.showinfo(
+                "Installazione",
+                "Per installare l'aggiornamento:\n\n"
+                "1. Chiudi LAC TRANSLATE\n"
+                "2. Esegui l'installer scaricato\n"
+                "3. Riavvia l'applicazione"
+            )
+        else:
+            messagebox.showerror("Errore", "Download fallito o file corrotto.")
+    
+    def handle_download_error(self, error_msg, progress_window):
+        """Gestisce errore download"""
+        progress_window.destroy()
+        messagebox.showerror("Errore Download", f"Errore durante download:\n\n{error_msg}")
+    
+    def check_updates_on_startup(self):
+        """Controlla aggiornamenti all'avvio (background, non invasivo)"""
+        try:
+            import json
+            from datetime import datetime, timedelta
+            
+            # Carica configurazione
+            config_file = BASE_DIR / "config" / "update_config.json"
+            check_on_startup = True
+            check_interval_days = 7
+            
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                    check_on_startup = config.get('check_on_startup', True)
+                    check_interval_days = config.get('check_interval_days', 7)
+                    last_check_str = config.get('last_check')
+                    
+                    # Controlla se è passato abbastanza tempo dall'ultimo check
+                    if last_check_str:
+                        try:
+                            last_check = datetime.fromisoformat(last_check_str)
+                            days_since = (datetime.now() - last_check).days
+                            if days_since < check_interval_days:
+                                logging.info(f"Skipping update check (last checked {days_since} days ago)")
+                                return
+                        except:
+                            pass
+                except:
+                    pass
+            
+            if not check_on_startup:
+                return
+            
+            # Controlla in background (non bloccare avvio)
+            def background_check():
+                try:
+                    from update_checker import UpdateChecker
+                    
+                    checker = UpdateChecker()
+                    update_info = checker.check_for_updates()
+                    
+                    # Salva timestamp ultimo check
+                    if config_file.exists():
+                        try:
+                            with open(config_file, 'r') as f:
+                                config = json.load(f)
+                        except:
+                            config = {}
+                    else:
+                        config = {}
+                    
+                    config['last_check'] = datetime.now().isoformat()
+                    
+                    config_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(config_file, 'w') as f:
+                        json.dump(config, f, indent=2)
+                    
+                    # Notifica solo se aggiornamento disponibile
+                    if update_info and update_info.get('available'):
+                        latest = update_info['latest_version']
+                        current = update_info['current_version']
+                        release_url = update_info['release_info'].get('html_url', '')
+                        
+                        # Notifica non invasiva (dopo 5 secondi dall'avvio)
+                        def show_notification():
+                            response = messagebox.askyesno(
+                                "Aggiornamento Disponibile",
+                                f"Nuova versione disponibile!\n\n"
+                                f"Versione corrente: {current}\n"
+                                f"Nuova versione: {latest}\n\n"
+                                f"Vuoi verificare gli aggiornamenti ora?"
+                            )
+                            if response:
+                                self.check_updates()
+                        
+                        self.root.after(5000, show_notification)  # Dopo 5 secondi
+                        
+                except Exception as e:
+                    logging.debug(f"Background update check failed (non-critical): {e}")
+            
+            # Avvia check in thread separato
+            threading.Thread(target=background_check, daemon=True).start()
+            
+        except Exception as e:
+            logging.debug(f"Error in startup update check (non-critical): {e}")
     
     def setup_drag_drop(self):
         """Setup drag and drop per file PDF"""
