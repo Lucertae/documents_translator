@@ -1,7 +1,0 @@
-{
-  "app/license_manager.py": "ccbd9d6b334f3ac5bbb28d4900b316a272fce8c188ba456d1a30e920fbcf834e",
-  "app/license_activation.py": "20bddf29a5ec2eab3081f84f1946dce1f487c0c0db3611145a02e248f33a043d",
-  "app/pdf_translator_gui.py": "beac8bbd69b486f18f0bf3b7603e8737512ae194b7bbeb3b5cbbe588697d230c",
-  "app/integrity_checker.py": "23f1f8d113f7937693386ef7c6681baa4ef6dbae27aa0014023b728bae279adb",
-  "app/security_validator.py": "eabf23be816707b323b5d86b33b03b529f73675b531753caec90aa777b4de790"
-}

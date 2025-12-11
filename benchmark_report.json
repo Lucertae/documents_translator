@@ -1,0 +1,80 @@
+{
+  "timestamp": "2025-12-10T17:13:23.559990",
+  "total_documents": 1,
+  "total_pages_tested": 2,
+  "total_time_seconds": 46.43988347053528,
+  "avg_extraction_time_ms": 9.986400604248047,
+  "avg_translation_time_ms": 11350.056648254395,
+  "avg_render_time_ms": 9702.208518981934,
+  "avg_text_quality": 1.0,
+  "documents": [
+    {
+      "filename": "Coates_825.pdf",
+      "total_pages": 36,
+      "pages_tested": 2,
+      "scanned_pages": 0,
+      "native_pages": 2,
+      "total_extraction_time_ms": 19.972801208496094,
+      "total_translation_time_ms": 22700.11329650879,
+      "total_render_time_ms": 19404.417037963867,
+      "total_time_ms": 46439.55755233765,
+      "avg_text_quality": 1.0,
+      "total_words_extracted": 167,
+      "total_words_translated": 197,
+      "page_metrics": [
+        {
+          "page_num": 1,
+          "is_scanned": false,
+          "scan_detection_reason": "native_pdf (coverage=16.5%, words=96)",
+          "extraction_method": "native",
+          "extraction_time_ms": 18.656015396118164,
+          "text_quality_score": 1.0,
+          "word_count": 96,
+          "char_count": 895,
+          "translation_time_ms": 14794.995546340942,
+          "source_words": 96,
+          "translated_words": 127,
+          "translation_ratio": 1.3229166666666667,
+          "sentence_count": 5,
+          "render_time_ms": 11314.453125,
+          "blocks_processed": 14,
+          "lines_translated": 20,
+          "red_spans": 20,
+          "black_spans": 0,
+          "original_lines": 19,
+          "line_coverage": 1.0526315789473684,
+          "issues": []
+        },
+        {
+          "page_num": 2,
+          "is_scanned": false,
+          "scan_detection_reason": "native_pdf (coverage=0.0%, words=79)",
+          "extraction_method": "native",
+          "extraction_time_ms": 1.3167858123779297,
+          "text_quality_score": 1.0,
+          "word_count": 71,
+          "char_count": 621,
+          "translation_time_ms": 7905.117750167847,
+          "source_words": 71,
+          "translated_words": 70,
+          "translation_ratio": 0.9859154929577465,
+          "sentence_count": 1,
+          "render_time_ms": 8089.963912963867,
+          "blocks_processed": 21,
+          "lines_translated": 35,
+          "red_spans": 17,
+          "black_spans": 0,
+          "original_lines": 42,
+          "line_coverage": 0.8333333333333334,
+          "issues": [
+            "High word overlap (66.7%) - undertranslated?"
+          ]
+        }
+      ],
+      "issues": []
+    }
+  ],
+  "recommendations": [
+    "TRANSLATION SPEED: Average 11350ms per page. Consider batch translation or model quantization."
+  ]
+}

@@ -1,12 +1,5 @@
-# LAC TRANSLATE v2.0 - Requirements
-# PDF Translation with OCR Support
-
-# REQUISITI SISTEMA:
-# - Windows 10/11 (testato)
-# - Python 3.8+ (obbligatorio)
-# - RAM: 4GB minimo, 8GB consigliato
-# - Spazio disco: 2GB liberi
-# - Connessione internet per download modelli
+# LAC TRANSLATE v3.0 - Requirements
+# Professional PDF Translation with NLLB-200
 
 # Core PDF processing
 PyMuPDF>=1.24.0
@@ -14,47 +7,24 @@ PyMuPDF>=1.24.0
 # Image processing for OCR
 Pillow>=10.0.0
 
-# Offline translation engine
-argostranslate>=1.9.0
+# World-class translation: NLLB-200 distilled-600M
+transformers>=4.40.0
+sentencepiece>=0.2.0
+torch>=2.0.0
+sacremoses>=0.1.0
 
-# OCR (Optical Character Recognition)
-pytesseract>=0.3.10
+# OCR (Optical Character Recognition) - PaddleOCR (superior quality & speed)
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0  # CPU version (lightweight)
 pdf2image>=1.16.3
 
-# Online translation (optional)
-deep-translator>=1.11.4
+# Legacy OCR (deprecated)
+# pytesseract>=0.3.10
 
-# License system and security (required)
-cryptography>=41.0.0  # Encryption per sicurezza dati
-psutil>=5.9.0  # System information per security validation
+# Qt6 GUI Framework
+PySide6>=6.6.0
 
-# Optional: Dolphin OCR dependencies (install manually if using Dolphin)
-# torch>=2.0.0  # Uncomment if using Dolphin OCR
-# transformers>=4.30.0  # Uncomment if using Dolphin OCR
-# huggingface_hub>=0.16.0  # Uncomment if using Dolphin OCR
-
-# Optional: Chandra OCR dependencies (install manually if using Chandra)
-# Install from chandra repository: cd chandra && pip install -r requirements.txt
-
-# Drag & Drop support (optional - nice-to-have)
-# tkinterdnd2>=0.3.0  # Uncomment for full drag & drop support
-# Note: Requires: pip install tkinterdnd2
-# Works on Windows/macOS/Linux
-
-# Additional dependencies (auto-installed)
-# - tkinter (built-in Python GUI)
-# - Tesseract OCR (installed via winget/batch)
-
-# LIMITAZIONI:
-# - Argos Translate: Qualità inferiore a Google, solo 7 lingue
-# - OCR: Solo inglese/italiano di default, 15-30 sec/pagina
-# - Installazione: Richiede competenze tecniche
-# - Windows: Script batch solo per Windows
-# - Modelli: ~800MB per installazione completa
-
-# INSTALLAZIONE:
-# 1. Installa Python 3.8+ da python.org
-# 2. Esegui: INSTALLA_DIPENDENZE.bat
-# 3. Esegui: INSTALLA_OCR.bat
-# 4. Verifica: VERIFICA_INSTALLAZIONE.bat
+# Legacy (deprecated, will be removed)
+# argostranslate>=1.9.0
+# deep-translator>=1.11.4
 

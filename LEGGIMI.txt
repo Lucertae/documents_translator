@@ -1,0 +1,44 @@
+🌍 LAC TRANSLATE v2.0 - PDF Translator con OCR
+================================================
+
+🚀 AVVIO RAPIDO:
+1. Doppio click su: AVVIA_GUI.bat
+2. Apri PDF e traduci!
+
+📁 CARTELLA COMPLETA:
+- app/                    → Codice applicazione
+- output/                 → PDF tradotti salvati
+- logs/                   → Log e debug
+- README.md              → Guida completa
+- FEATURES.md            → Caratteristiche dettagliate
+- QUICK_START_GUI.md     → Guida rapida
+- GUIDA_OCR.md           → Guida OCR specifica
+- CHANGELOG.md           → Cronologia modifiche
+
+🔧 INSTALLAZIONE:
+- INSTALLA_DIPENDENZE.bat → Installazione completa
+- INSTALLA_OCR.bat        → Solo OCR
+- INSTALLA_OCR_AUTO.ps1   → OCR automatico
+
+✨ NOVITÀ v2.0:
+- OCR Tesseract integrato
+- Formattazione strutturata
+- Auto-ridimensionamento pagine
+- Tema bianco e nero
+- Status bar intelligente
+
+🔍 OCR AUTOMATICO:
+- Rileva PDF scansionati
+- 8 metodi estrazione testo
+- Formattazione intelligente
+- Privacy totale offline
+
+🎯 TRADUTTORI:
+- Google Translate (online, veloce)
+- Argos Translate (offline, privacy)
+
+📞 SUPPORTO:
+- Log: logs/pdf_translator.log
+- Repository: https://github.com/davideuler/pdf-translator-for-human
+
+Buona traduzione! 🎉
