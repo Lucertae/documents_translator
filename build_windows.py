@@ -5,6 +5,7 @@ Creates a single .exe file with PyInstaller
 """
 import PyInstaller.__main__
 import sys
+import os
 from pathlib import Path
 
 def build_exe():
@@ -14,6 +15,10 @@ def build_exe():
     root = Path(__file__).parent
     app_dir = root / "app"
     main_file = app_dir / "main_qt.py"
+    
+    # Platform-specific separator for --add-data
+    # Windows uses ';', Linux/Mac use ':'
+    sep = ';' if sys.platform == 'win32' else ':'
     
     # Build arguments for PyInstaller
     args = [
@@ -49,10 +54,10 @@ def build_exe():
         '--collect-all=paddlepaddle',
         '--collect-all=PySide6',
         
-        # Copy data files
-        f'--add-data={root / "logs"};logs',
-        f'--add-data={root / "input"};input',
-        f'--add-data={root / "output"};output',
+        # Copy data files (using platform-specific separator)
+        f'--add-data={root / "logs"}{sep}logs',
+        f'--add-data={root / "input"}{sep}input',
+        f'--add-data={root / "output"}{sep}output',
         
         # Exclude unnecessary modules to reduce size
         '--exclude-module=matplotlib',
