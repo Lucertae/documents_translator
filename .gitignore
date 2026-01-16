@@ -53,7 +53,3 @@ output/*.pdf
 
 # Argos models (downloaded at runtime)
 # .local/share/argos-translate/
-
-docs/*
-logs/*
-output/*

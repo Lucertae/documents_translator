@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QPropertyAnimation, QEasingCurve, Property, QSize
 from PySide6.QtGui import QAction, QKeySequence, QFont, QColor, QPainter, QLinearGradient, QPainterPath, QIcon, QPen
-import qtawesome as qta
 import logging
 from pathlib import Path
 
@@ -26,17 +25,19 @@ class TranslationWorker(QThread):
     finished = Signal(object)
     error = Signal(str)
     
-    def __init__(self, pdf_processor, translator, page_num):
+    def __init__(self, pdf_processor, translator, page_num, use_original_color=True):
         super().__init__()
         self.pdf_processor = pdf_processor
         self.translator = translator
         self.page_num = page_num
+        self.use_original_color = use_original_color
         
     def run(self):
         try:
             translated_doc = self.pdf_processor.translate_page(
                 self.page_num,
-                self.translator
+                self.translator,
+                use_original_color=self.use_original_color
             )
             self.finished.emit(translated_doc)
         except Exception as e:
@@ -44,19 +45,13 @@ class TranslationWorker(QThread):
 
 
 class GlowButton(QPushButton):
-    """Premium button with animated glow effect and FontAwesome icons."""
+    """Premium button with animated glow effect."""
     
-    def __init__(self, text="", icon_name=None, accent=False, parent=None):
+    def __init__(self, text="", accent=False, parent=None):
         super().__init__(text, parent)
         self.accent = accent
         self._glow_opacity = 0.0
         self.setMouseTracking(True)
-        
-        # Set FontAwesome icon if provided
-        if icon_name:
-            icon_color = '#ffffff' if accent else '#e4e4e7'
-            self.setIcon(qta.icon(icon_name, color=icon_color))
-            self.setIconSize(QSize(18, 18))
         
         # Glow animation
         self._glow_anim = QPropertyAnimation(self, b"glow_opacity")
@@ -240,44 +235,33 @@ class MainWindow(QMainWindow):
         # Spacer with subtle line
         layout.addSpacing(32)
         
-        # Document info - con icona FontAwesome
-        self.file_icon = QLabel()
-        self.file_icon.setPixmap(qta.icon('fa5s.file-pdf', color='#71717a').pixmap(QSize(16, 16)))
-        layout.addWidget(self.file_icon)
-        layout.addSpacing(8)
-        
-        self.file_label = QLabel("Nessun documento caricato")
+        # Document info
+        self.file_label = QLabel("No document loaded")
         self.file_label.setObjectName("file_label")
         layout.addWidget(self.file_label, 1)
         
-        # Page navigation - clear and intuitive
+        # Page navigation - minimalist
         nav_container = QWidget()
         nav_layout = QHBoxLayout(nav_container)
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(8)
         
-        self.btn_prev = QPushButton("Indietro")
-        self.btn_prev.setIcon(qta.icon('fa5s.chevron-left', color='#ffffff'))
+        self.btn_prev = QPushButton("‹")
         self.btn_prev.setObjectName("nav_btn")
-        self.btn_prev.setFixedSize(100, 38)
-        self.btn_prev.setToolTip("Vai alla pagina precedente")
+        self.btn_prev.setFixedSize(36, 36)
         self.btn_prev.clicked.connect(self.previous_page)
         self.btn_prev.setEnabled(False)
         nav_layout.addWidget(self.btn_prev)
         
         self.page_label = QLabel("—")
         self.page_label.setObjectName("page_indicator")
-        self.page_label.setFixedWidth(100)
+        self.page_label.setFixedWidth(80)
         self.page_label.setAlignment(Qt.AlignCenter)
-        self.page_label.setToolTip("Pagina corrente / Totale pagine")
         nav_layout.addWidget(self.page_label)
         
-        self.btn_next = QPushButton("Avanti")
-        self.btn_next.setIcon(qta.icon('fa5s.chevron-right', color='#ffffff'))
-        self.btn_next.setLayoutDirection(Qt.RightToLeft)  # Icon on right
+        self.btn_next = QPushButton("›")
         self.btn_next.setObjectName("nav_btn")
-        self.btn_next.setFixedSize(100, 38)
-        self.btn_next.setToolTip("Vai alla pagina successiva")
+        self.btn_next.setFixedSize(36, 36)
         self.btn_next.clicked.connect(self.next_page)
         self.btn_next.setEnabled(False)
         nav_layout.addWidget(self.btn_next)
@@ -290,184 +274,99 @@ class MainWindow(QMainWindow):
         """Create premium sidebar with controls."""
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(320)
+        sidebar.setFixedWidth(280)
         
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(0)
         
-        # Section: Document - con icona FontAwesome
-        section_doc_layout = QHBoxLayout()
-        section_doc_layout.setContentsMargins(0, 0, 0, 0)
-        section_doc_layout.setSpacing(8)
-        section_doc_icon = QLabel()
-        section_doc_icon.setPixmap(qta.icon('fa5s.file-alt', color='#a1a1aa').pixmap(QSize(14, 14)))
-        section_doc_layout.addWidget(section_doc_icon)
-        section_doc = QLabel("DOCUMENTO")
+        # Section: Document
+        section_doc = QLabel("DOCUMENT")
         section_doc.setObjectName("section_label")
-        section_doc_layout.addWidget(section_doc)
-        section_doc_layout.addStretch()
-        layout.addLayout(section_doc_layout)
-        layout.addSpacing(10)
+        layout.addWidget(section_doc)
+        layout.addSpacing(12)
         
-        self.btn_open = GlowButton("Apri PDF...", icon_name='fa5s.folder-open')
+        self.btn_open = GlowButton("Open PDF")
         self.btn_open.setObjectName("btn_primary")
         self.btn_open.setFixedHeight(48)
-        self.btn_open.setToolTip("Clicca per selezionare un file PDF da tradurre")
         self.btn_open.clicked.connect(self.open_pdf)
         layout.addWidget(self.btn_open)
         
-        # Hint per utenti
-        hint_open = QLabel("Seleziona il documento PDF da tradurre")
-        hint_open.setObjectName("hint_label")
-        layout.addWidget(hint_open)
+        layout.addSpacing(32)
         
-        layout.addSpacing(24)
-        
-        # Section: Languages - con icona FontAwesome
-        section_lang_layout = QHBoxLayout()
-        section_lang_layout.setContentsMargins(0, 0, 0, 0)
-        section_lang_layout.setSpacing(8)
-        section_lang_icon = QLabel()
-        section_lang_icon.setPixmap(qta.icon('fa5s.language', color='#a1a1aa').pixmap(QSize(14, 14)))
-        section_lang_layout.addWidget(section_lang_icon)
-        section_lang = QLabel("TRADUZIONE")
+        # Section: Languages
+        section_lang = QLabel("TRANSLATION")
         section_lang.setObjectName("section_label")
-        section_lang_layout.addWidget(section_lang)
-        section_lang_layout.addStretch()
-        layout.addLayout(section_lang_layout)
-        layout.addSpacing(10)
+        layout.addWidget(section_lang)
+        layout.addSpacing(12)
         
         # Source language
         source_row = QWidget()
         source_layout = QVBoxLayout(source_row)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        source_layout.setSpacing(4)
+        source_layout.setSpacing(6)
         
-        source_label_layout = QHBoxLayout()
-        source_label_layout.setContentsMargins(0, 0, 0, 0)
-        source_label_layout.setSpacing(6)
-        source_icon = QLabel()
-        source_icon.setPixmap(qta.icon('fa5s.book', color='#e4e4e7').pixmap(QSize(12, 12)))
-        source_label_layout.addWidget(source_icon)
-        source_label = QLabel("Lingua originale:")
+        source_label = QLabel("Source")
         source_label.setObjectName("field_label")
-        source_label_layout.addWidget(source_label)
-        source_label_layout.addStretch()
-        source_layout.addLayout(source_label_layout)
+        source_layout.addWidget(source_label)
         
         self.combo_source = QComboBox()
         self.combo_source.setObjectName("lang_select")
         self.combo_source.addItems(["Auto-Detect"] + TranslationEngine.get_supported_languages())
         self.combo_source.setCurrentText("English")
-        self.combo_source.setFixedHeight(40)
+        self.combo_source.setFixedHeight(44)
         self.combo_source.currentTextChanged.connect(self.update_translator)
         source_layout.addWidget(self.combo_source)
         
         layout.addWidget(source_row)
-        layout.addSpacing(8)
+        layout.addSpacing(16)
         
         # Arrow indicator
         arrow = QLabel("↓")
         arrow.setObjectName("lang_arrow")
         arrow.setAlignment(Qt.AlignCenter)
         layout.addWidget(arrow)
-        layout.addSpacing(8)
+        layout.addSpacing(16)
         
         # Target language
         target_row = QWidget()
         target_layout = QVBoxLayout(target_row)
         target_layout.setContentsMargins(0, 0, 0, 0)
-        target_layout.setSpacing(4)
+        target_layout.setSpacing(6)
         
-        target_label_layout = QHBoxLayout()
-        target_label_layout.setContentsMargins(0, 0, 0, 0)
-        target_label_layout.setSpacing(6)
-        target_icon = QLabel()
-        target_icon.setPixmap(qta.icon('fa5s.bullseye', color='#e4e4e7').pixmap(QSize(12, 12)))
-        target_label_layout.addWidget(target_icon)
-        target_label = QLabel("Traduci in:")
+        target_label = QLabel("Target")
         target_label.setObjectName("field_label")
-        target_label_layout.addWidget(target_label)
-        target_label_layout.addStretch()
-        target_layout.addLayout(target_label_layout)
+        target_layout.addWidget(target_label)
         
         self.combo_target = QComboBox()
         self.combo_target.setObjectName("lang_select")
         self.combo_target.addItems(TranslationEngine.get_supported_languages())
         self.combo_target.setCurrentText("Italiano")
-        self.combo_target.setFixedHeight(40)
+        self.combo_target.setFixedHeight(44)
         self.combo_target.currentTextChanged.connect(self.update_translator)
         target_layout.addWidget(self.combo_target)
         
         layout.addWidget(target_row)
         
-        layout.addSpacing(24)
+        layout.addSpacing(32)
         
         # Translate button - Hero action
-        self.btn_translate = GlowButton("TRADUCI PAGINA", icon_name='fa5s.play', accent=True)
+        self.btn_translate = GlowButton("Translate Page", accent=True)
         self.btn_translate.setObjectName("btn_accent")
-        self.btn_translate.setFixedHeight(50)
-        self.btn_translate.setToolTip("Traduce solo la pagina attualmente visualizzata")
+        self.btn_translate.setFixedHeight(52)
         self.btn_translate.clicked.connect(self.translate_current_page)
         self.btn_translate.setEnabled(False)
         layout.addWidget(self.btn_translate)
         
-        layout.addSpacing(10)
+        layout.addSpacing(12)
         
         # Translate all
-        self.btn_translate_all = GlowButton("Traduci tutto", icon_name='fa5s.copy')
+        self.btn_translate_all = GlowButton("Translate All Pages")
         self.btn_translate_all.setObjectName("btn_secondary")
         self.btn_translate_all.setFixedHeight(44)
-        self.btn_translate_all.setToolTip("Traduce tutte le pagine del documento (può richiedere tempo)")
         self.btn_translate_all.clicked.connect(self.translate_all_pages)
         self.btn_translate_all.setEnabled(False)
         layout.addWidget(self.btn_translate_all)
-        
-        layout.addSpacing(24)
-        
-        # Section: View Controls (Zoom) - con icona FontAwesome
-        section_view_layout = QHBoxLayout()
-        section_view_layout.setContentsMargins(0, 0, 0, 0)
-        section_view_layout.setSpacing(8)
-        section_view_icon = QLabel()
-        section_view_icon.setPixmap(qta.icon('fa5s.search', color='#a1a1aa').pixmap(QSize(14, 14)))
-        section_view_layout.addWidget(section_view_icon)
-        section_view = QLabel("VISUALIZZA")
-        section_view.setObjectName("section_label")
-        section_view_layout.addWidget(section_view)
-        section_view_layout.addStretch()
-        layout.addLayout(section_view_layout)
-        layout.addSpacing(10)
-        
-        # Zoom controls row
-        zoom_row = QWidget()
-        zoom_layout = QHBoxLayout(zoom_row)
-        zoom_layout.setContentsMargins(0, 0, 0, 0)
-        zoom_layout.setSpacing(6)
-        
-        self.btn_zoom_out = GlowButton("", icon_name='fa5s.minus')
-        self.btn_zoom_out.setObjectName("btn_small")
-        self.btn_zoom_out.setFixedSize(40, 40)
-        self.btn_zoom_out.setToolTip("Riduci zoom")
-        self.btn_zoom_out.clicked.connect(lambda: self.original_viewer.zoom_out())
-        zoom_layout.addWidget(self.btn_zoom_out)
-        
-        self.btn_zoom_fit = GlowButton("Adatta", icon_name='fa5s.expand')
-        self.btn_zoom_fit.setObjectName("btn_small")
-        self.btn_zoom_fit.setFixedHeight(40)
-        self.btn_zoom_fit.setToolTip("Adatta alla finestra")
-        self.btn_zoom_fit.clicked.connect(lambda: self.original_viewer.zoom_fit())
-        zoom_layout.addWidget(self.btn_zoom_fit, 1)
-        
-        self.btn_zoom_in = GlowButton("", icon_name='fa5s.plus')
-        self.btn_zoom_in.setObjectName("btn_small")
-        self.btn_zoom_in.setFixedSize(40, 40)
-        self.btn_zoom_in.setToolTip("Aumenta zoom")
-        self.btn_zoom_in.clicked.connect(lambda: self.original_viewer.zoom_in())
-        zoom_layout.addWidget(self.btn_zoom_in)
-        
-        layout.addWidget(zoom_row)
         
         layout.addStretch()
         
@@ -478,47 +377,31 @@ class MainWindow(QMainWindow):
         progress_layout.setContentsMargins(0, 0, 0, 0)
         progress_layout.setSpacing(8)
         
-        self.progress_label = QLabel("Traduzione in corso...")
+        self.progress_label = QLabel("Translating...")
         self.progress_label.setObjectName("progress_label")
         progress_layout.addWidget(self.progress_label)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("progress_bar")
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setFixedHeight(4)
         self.progress_bar.setTextVisible(False)
         progress_layout.addWidget(self.progress_bar)
         
         layout.addWidget(self.progress_container)
-        layout.addSpacing(20)
+        layout.addSpacing(24)
         
-        # Export section - con icona FontAwesome
-        section_export_layout = QHBoxLayout()
-        section_export_layout.setContentsMargins(0, 0, 0, 0)
-        section_export_layout.setSpacing(8)
-        section_export_icon = QLabel()
-        section_export_icon.setPixmap(qta.icon('fa5s.save', color='#a1a1aa').pixmap(QSize(14, 14)))
-        section_export_layout.addWidget(section_export_icon)
-        section_export = QLabel("SALVA")
+        # Export section
+        section_export = QLabel("EXPORT")
         section_export.setObjectName("section_label")
-        section_export_layout.addWidget(section_export)
-        section_export_layout.addStretch()
-        layout.addLayout(section_export_layout)
-        layout.addSpacing(10)
+        layout.addWidget(section_export)
+        layout.addSpacing(12)
         
-        self.btn_save = GlowButton("Salva PDF tradotto...", icon_name='fa5s.file-download')
+        self.btn_save = GlowButton("Save PDF")
         self.btn_save.setObjectName("btn_primary")
         self.btn_save.setFixedHeight(44)
-        self.btn_save.setToolTip("Salva il documento tradotto come nuovo file PDF")
         self.btn_save.clicked.connect(self.save_pdf)
         self.btn_save.setEnabled(False)
         layout.addWidget(self.btn_save)
-        
-        # Hint
-        hint_save = QLabel("Esporta il documento tradotto")
-        hint_save.setObjectName("hint_label")
-        layout.addWidget(hint_save)
-        
-        layout.addSpacing(10)
         
         return sidebar
     
@@ -633,35 +516,35 @@ class MainWindow(QMainWindow):
             }
             
             QLabel#page_indicator {
-                font-size: 14px;
-                font-weight: 700;
-                color: #ffffff;
+                font-size: 13px;
+                font-weight: 600;
+                
+                color: #e4e4e7;
                 background: #18181b;
-                border: 1px solid #3f3f46;
-                border-radius: 10px;
-                padding: 0 16px;
+                border: 1px solid #27272a;
+                border-radius: 8px;
+                padding: 0 12px;
             }
             
             QPushButton#nav_btn {
-                font-size: 13px;
-                font-weight: 600;
-                color: #ffffff;
-                background: #27272a;
-                border: 1px solid #3f3f46;
-                border-radius: 10px;
+                font-size: 18px;
+                font-weight: 300;
+                color: #71717a;
+                background: transparent;
+                border: 1px solid #27272a;
+                border-radius: 8px;
             }
             QPushButton#nav_btn:hover {
-                color: #ffffff;
-                background: #3f3f46;
-                border-color: #52525b;
+                color: #fafafa;
+                background: #27272a;
+                border-color: #3f3f46;
             }
             QPushButton#nav_btn:pressed {
                 background: #18181b;
             }
             QPushButton#nav_btn:disabled {
-                color: #52525b;
-                background: #1f1f23;
-                border-color: #27272a;
+                color: #3f3f46;
+                border-color: #1f1f23;
             }
             
             /* ─── Main Content ───────────────────────────────────────────── */
@@ -677,18 +560,18 @@ class MainWindow(QMainWindow):
             }
             
             QLabel#section_label {
-                font-size: 12px;
+                font-size: 10px;
                 font-weight: 700;
-                letter-spacing: 1px;
-                color: #a1a1aa;
+                letter-spacing: 2px;
+                color: #52525b;
                 background: transparent;
-                padding-bottom: 6px;
+                padding-bottom: 4px;
             }
             
             QLabel#field_label {
-                font-size: 13px;
-                font-weight: 600;
-                color: #e4e4e7;
+                font-size: 12px;
+                font-weight: 500;
+                color: #71717a;
                 background: transparent;
             }
             
@@ -747,113 +630,73 @@ class MainWindow(QMainWindow):
             
             /* ─── Buttons ────────────────────────────────────────────────── */
             QPushButton#btn_primary {
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
-                color: #ffffff;
-                background: #27272a;
-                border: 1px solid #3f3f46;
-                border-radius: 12px;
-                padding: 8px 16px;
-                text-align: left;
+                color: #fafafa;
+                background: #18181b;
+                border: 1px solid #27272a;
+                border-radius: 10px;
             }
             QPushButton#btn_primary:hover {
-                background: #3f3f46;
-                border-color: #52525b;
-                color: #ffffff;
+                background: #27272a;
+                border-color: #3f3f46;
             }
             QPushButton#btn_primary:pressed {
-                background: #18181b;
+                background: #0f0f12;
             }
             QPushButton#btn_primary:disabled {
-                color: #71717a;
-                background: #18181b;
-                border-color: #27272a;
+                color: #3f3f46;
+                background: #0f0f12;
+                border-color: #1f1f23;
             }
             
             QPushButton#btn_accent {
-                font-size: 15px;
-                font-weight: 700;
-                color: #ffffff;
+                font-size: 14px;
+                font-weight: 600;
+                color: #022c22;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #059669, stop:1 #10b981);
+                    stop:0 #10b981, stop:1 #34d399);
                 border: none;
-                border-radius: 14px;
-                padding: 10px 20px;
+                border-radius: 12px;
             }
             QPushButton#btn_accent:hover {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #10b981, stop:1 #34d399);
-                color: #ffffff;
+                    stop:0 #34d399, stop:1 #6ee7b7);
             }
             QPushButton#btn_accent:pressed {
-                background: #047857;
+                background: #059669;
             }
             QPushButton#btn_accent:disabled {
-                color: #9ca3af;
-                background: #1f2937;
-                border: 1px solid #374151;
+                color: #064e3b;
+                background: #052e16;
+                border: 1px solid #064e3b;
             }
             
             QPushButton#btn_secondary {
-                font-size: 14px;
-                font-weight: 600;
-                color: #ffffff;
-                background: #1f1f23;
-                border: 1px solid #3f3f46;
-                border-radius: 12px;
-                padding: 8px 16px;
-                text-align: left;
-            }
-            QPushButton#btn_secondary:hover {
-                color: #ffffff;
-                background: #27272a;
-                border-color: #52525b;
-            }
-            QPushButton#btn_secondary:pressed {
-                background: #18181b;
-            }
-            QPushButton#btn_secondary:disabled {
-                color: #71717a;
-                background: #18181b;
-                border-color: #27272a;
-            }
-            
-            /* ─── Hint Labels ─────────────────────────────────────────────── */
-            QLabel#hint_label {
-                font-size: 11px;
-                font-weight: 400;
-                color: #71717a;
+                font-size: 13px;
+                font-weight: 500;
+                color: #a1a1aa;
                 background: transparent;
-                padding: 4px 0 0 4px;
-            }
-            
-            /* ─── Small Buttons (Zoom, etc) ─────────────────────────────── */
-            QPushButton#btn_small {
-                font-size: 14px;
-                font-weight: 600;
-                color: #ffffff;
-                background: #1f1f23;
-                border: 1px solid #3f3f46;
+                border: 1px solid #27272a;
                 border-radius: 10px;
             }
-            QPushButton#btn_small:hover {
-                background: #27272a;
-                border-color: #52525b;
-                color: #ffffff;
-            }
-            QPushButton#btn_small:pressed {
+            QPushButton#btn_secondary:hover {
+                color: #e4e4e7;
                 background: #18181b;
+                border-color: #3f3f46;
             }
-            QPushButton#btn_small:disabled {
-                color: #52525b;
-                background: #18181b;
-                border-color: #27272a;
+            QPushButton#btn_secondary:pressed {
+                background: #0f0f12;
+            }
+            QPushButton#btn_secondary:disabled {
+                color: #3f3f46;
+                border-color: #1f1f23;
             }
             
             /* ─── Progress ───────────────────────────────────────────────── */
             QLabel#progress_label {
-                font-size: 13px;
-                font-weight: 600;
+                font-size: 12px;
+                font-weight: 500;
                 color: #10b981;
                 background: transparent;
             }
@@ -861,7 +704,7 @@ class MainWindow(QMainWindow):
             QProgressBar#progress_bar {
                 background: #18181b;
                 border: none;
-                border-radius: 3px;
+                border-radius: 2px;
             }
             QProgressBar#progress_bar::chunk {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
@@ -1154,29 +997,11 @@ class MainWindow(QMainWindow):
         source_lang = self.combo_source.currentText()
         target_lang = self.combo_target.currentText()
         
-        # Get language codes
         source_code = "en" if source_lang == "Auto-Detect" else TranslationEngine.get_language_code(source_lang)
         target_code = TranslationEngine.get_language_code(target_lang)
         
-        # Prevent same language translation (en -> en, etc)
-        if source_code == target_code:
-            self.status_bar.showMessage("⚠️ Seleziona lingue diverse per sorgente e destinazione")
-            self.btn_translate.setEnabled(False)
-            self.btn_translate_all.setEnabled(False)
-            return
-        
-        # Re-enable translate buttons if a PDF is loaded
-        if self.pdf_processor:
-            self.btn_translate.setEnabled(True)
-            self.btn_translate_all.setEnabled(True)
-        
-        try:
-            if self.translator:
-                self.translator.set_languages(source_code, target_code)
-                self.status_bar.showMessage(f"✓ Pronto: {source_lang} → {target_lang}")
-        except ValueError as e:
-            self.status_bar.showMessage(f"⚠️ Coppia linguistica non supportata")
-            logging.warning(f"Language pair not supported: {e}")
+        if self.translator:
+            self.translator.set_languages(source_code, target_code)
     
     @Slot()
     def translate_current_page(self):

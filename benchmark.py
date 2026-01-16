@@ -258,18 +258,23 @@ def analyze_pdf_output(original_page: pymupdf.Page, translated_page: pymupdf.Pag
     """
     Analyze PDF rendering quality.
     
+    Now compares actual text content instead of relying on color,
+    since use_original_color=True means translated text can be any color.
+    
     Returns:
         Tuple of (quality_score 0-1, list of issues, span_stats dict)
     """
     issues = []
     score = 1.0
     
-    # Get text from translated page
+    # Get text from both pages
     trans_text = translated_page.get_text()
     trans_dict = translated_page.get_text("dict")
     
-    # Get original line count for comparison
+    orig_text = original_page.get_text()
     orig_dict = original_page.get_text("dict")
+    
+    # Get original line count for comparison
     orig_lines = sum(
         len(b.get("lines", []))
         for b in orig_dict.get("blocks", [])
@@ -279,11 +284,22 @@ def analyze_pdf_output(original_page: pymupdf.Page, translated_page: pymupdf.Pag
     if not trans_text or len(trans_text.strip()) < 10:
         return 0.0, ["No text in output"], {"red_spans": 0, "black_spans": 0, "original_lines": orig_lines, "translated_lines": 0}
     
-    # Count spans by color
-    red_spans = 0   # Translated text (should be red)
-    black_spans = 0 # Original text (should be 0 if properly cleared)
-    other_spans = 0
+    # Collect original text spans for comparison
+    orig_spans_text = set()
+    for block in orig_dict.get("blocks", []):
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line.get("spans", []):
+                text = span.get("text", "").strip()
+                if text and len(text) > 2:  # Skip very short spans
+                    orig_spans_text.add(text.lower())
+    
+    # Analyze translated page spans
     trans_lines = 0
+    total_spans = 0
+    unchanged_spans = 0  # Spans identical to original (not translated)
+    translated_spans = 0  # Spans that differ from original (translated)
     
     for block in trans_dict.get("blocks", []):
         if "lines" not in block:
@@ -294,31 +310,36 @@ def analyze_pdf_output(original_page: pymupdf.Page, translated_page: pymupdf.Pag
                 text = span.get("text", "").strip()
                 if not text:
                     continue
-                    
-                color_int = span.get("color", 0)
-                r = ((color_int >> 16) & 0xFF)
-                g = ((color_int >> 8) & 0xFF)
-                b = (color_int & 0xFF)
                 
-                if r > 150 and g < 50 and b < 50:  # Red
-                    red_spans += 1
-                elif r < 50 and g < 50 and b < 50:  # Black
-                    black_spans += 1
+                total_spans += 1
+                
+                # Check if this text existed in the original
+                # (case-insensitive comparison)
+                if text.lower() in orig_spans_text:
+                    unchanged_spans += 1
                 else:
-                    other_spans += 1
+                    translated_spans += 1
     
     span_stats = {
-        "red_spans": red_spans,
-        "black_spans": black_spans,
-        "other_spans": other_spans,
+        "red_spans": translated_spans,  # For backward compatibility
+        "black_spans": unchanged_spans,  # For backward compatibility  
+        "total_spans": total_spans,
+        "unchanged_spans": unchanged_spans,
+        "translated_spans": translated_spans,
         "original_lines": orig_lines,
         "translated_lines": trans_lines
     }
     
-    # Check 1: Original text not properly removed (critical!)
-    if black_spans > 0:
-        issues.append(f"⚠️ CRITICAL: {black_spans} black spans (original text not removed)")
-        score -= min(0.5, black_spans * 0.05)
+    # Check 1: Too many unchanged spans might indicate failed translation
+    # But some overlap is normal (numbers, names, etc.)
+    if total_spans > 0:
+        unchanged_ratio = unchanged_spans / total_spans
+        if unchanged_ratio > 0.7 and total_spans > 10:
+            issues.append(f"⚠️ High unchanged text ratio ({unchanged_ratio:.1%}) - translation may have failed")
+            score -= 0.3
+    
+    # OLD CHECK REMOVED: "black spans = original not removed" is no longer valid
+    # because use_original_color=True means translated text IS black
     
     # Check 2: Line coverage
     line_coverage = trans_lines / orig_lines if orig_lines > 0 else 0
@@ -513,10 +534,13 @@ def benchmark_document(
             status = "✓" if text_quality > 0.7 else "⚠" if text_quality > 0.4 else "✗"
             print(f"    {status} {extraction_method}: {word_count} words, quality={text_quality:.2f}")
             print(f"      Extraction: {ext_time:.0f}ms, Translation: {trans_time:.0f}ms, Render: {render_time:.0f}ms")
-            # Show span stats
+            # Show span stats with new metrics
             coverage_status = "✓" if span_stats.get("line_coverage", 1) >= 0.95 else "⚠"
-            black_status = "✓" if span_stats.get("black_spans", 0) == 0 else "✗"
-            print(f"      Spans: {span_stats.get('red_spans', 0)} red {black_status}, {span_stats.get('black_spans', 0)} black, coverage={span_stats.get('line_coverage', 1):.1%} {coverage_status}")
+            translated = span_stats.get("translated_spans", span_stats.get("red_spans", 0))
+            unchanged = span_stats.get("unchanged_spans", span_stats.get("black_spans", 0))
+            total = span_stats.get("total_spans", translated + unchanged)
+            trans_pct = (translated / total * 100) if total > 0 else 0
+            print(f"      Spans: {translated}/{total} translated ({trans_pct:.0f}%), coverage={span_stats.get('line_coverage', 1):.1%} {coverage_status}")
             if page_issues:
                 for issue in page_issues[:3]:
                     print(f"      ⚠ {issue}")

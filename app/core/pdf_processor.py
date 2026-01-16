@@ -1,17 +1,630 @@
 """
 PDF processing module - PaddleOCR Edition
 Handles PDF loading, text extraction, OCR, and manipulation with superior quality.
+
+SPAN-LEVEL FORMATTING PRESERVATION:
+This module now preserves formatting at the span level, not just line level.
+This means bold, italic, color, and size are tracked per-segment and
+intelligently mapped to the translated text using proportional allocation.
 """
 import logging
+import math
 import io
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import pymupdf
 from PIL import Image
 import numpy as np
 
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
+
+
+@dataclass
+class SpanFormat:
+    """
+    Represents the formatting attributes of a single text span.
+    
+    This is used to preserve inline formatting (bold, italic, color, size)
+    at the character/word level rather than the line level.
+    
+    Superscript/Subscript detection:
+    - PyMuPDF flag bit 0 (1) = superscript
+    - Subscript detected by: smaller font + positioned below baseline
+    - Also detected by relative size (< 80% of line average)
+    """
+    text: str
+    bbox: Tuple[float, float, float, float]
+    size: float
+    font: str
+    color: Tuple[float, float, float]  # RGB 0.0-1.0
+    flags: int = 0
+    line_avg_size: float = 0  # Average size of the line (for sub/super detection)
+    origin_y: float = 0  # Y position of text origin (baseline)
+    line_origin_y: float = 0  # Average baseline Y of the line
+    
+    @property
+    def is_bold(self) -> bool:
+        """Check if span is bold (flag bit 16 or 'Bold' in font name)."""
+        return bool(self.flags & 16) or 'Bold' in self.font or 'bold' in self.font.lower()
+    
+    @property
+    def is_italic(self) -> bool:
+        """Check if span is italic (flag bit 2 or 'Italic' in font name)."""
+        return bool(self.flags & 2) or 'Italic' in self.font or 'italic' in self.font.lower()
+    
+    @property
+    def is_superscript(self) -> bool:
+        """
+        Check if span is superscript.
+        
+        Detection methods:
+        1. PyMuPDF flag bit 0 (1) = superscript
+        2. Font size significantly smaller (< 80%) AND positioned above baseline
+        3. Font name contains 'Super' or 'Sup'
+        """
+        # Method 1: Flag
+        if bool(self.flags & 1):
+            return True
+        
+        # Method 2: Size + position based detection
+        if self.line_avg_size > 0 and self.size < self.line_avg_size * 0.8:
+            # Smaller font - check if above baseline
+            if self.line_origin_y > 0 and self.origin_y > 0:
+                # In PDF, Y increases downward, so superscript has SMALLER y (higher up)
+                if self.origin_y < self.line_origin_y - self.size * 0.3:
+                    return True
+        
+        # Method 3: Font name
+        font_lower = self.font.lower()
+        if 'super' in font_lower or 'sup' in font_lower:
+            return True
+        
+        return False
+    
+    @property
+    def is_subscript(self) -> bool:
+        """
+        Check if span is subscript.
+        
+        Detection methods:
+        1. Font size significantly smaller (< 80%) AND positioned below baseline
+        2. Font name contains 'Sub'
+        """
+        # Subscript has no standard flag, so we rely on heuristics
+        
+        # Method 1: Size + position based detection
+        if self.line_avg_size > 0 and self.size < self.line_avg_size * 0.8:
+            # Smaller font - check if below baseline
+            if self.line_origin_y > 0 and self.origin_y > 0:
+                # In PDF, Y increases downward, so subscript has LARGER y (lower down)
+                if self.origin_y > self.line_origin_y + self.size * 0.2:
+                    return True
+        
+        # Method 2: Font name
+        font_lower = self.font.lower()
+        if 'sub' in font_lower and 'subhead' not in font_lower:
+            return True
+        
+        return False
+    
+    @property
+    def is_monospace(self) -> bool:
+        """Check if font is monospace."""
+        mono_patterns = ['Courier', 'Mono', 'Consolas', 'Monaco', 'Menlo', 'Source Code']
+        return any(p.lower() in self.font.lower() for p in mono_patterns)
+    
+    @property
+    def is_serif(self) -> bool:
+        """Check if font is serif."""
+        serif_patterns = ['Times', 'Serif', 'Georgia', 'Garamond', 'Palatino', 'Cambria']
+        return any(p.lower() in self.font.lower() for p in serif_patterns)
+    
+    @property
+    def char_count(self) -> int:
+        """Number of characters in this span."""
+        return len(self.text)
+    
+    @property
+    def word_count(self) -> int:
+        """Number of words in this span."""
+        return len(self.text.split())
+    
+    def format_key(self) -> str:
+        """
+        Generate a unique key for this formatting style.
+        Used to detect when formatting changes between spans.
+        """
+        return f"{self.is_bold}|{self.is_italic}|{self.size:.1f}|{self.color}|{self.font[:10]}"
+    
+    def to_css_style(self) -> str:
+        """Generate inline CSS for this span's formatting."""
+        styles = []
+        
+        if self.is_bold:
+            styles.append("font-weight: bold")
+        if self.is_italic:
+            styles.append("font-style: italic")
+        
+        r, g, b = self.color
+        styles.append(f"color: rgb({int(r*255)}, {int(g*255)}, {int(b*255)})")
+        
+        return "; ".join(styles)
+    
+    def to_html_open_tag(self) -> str:
+        """Generate opening HTML tags for formatting."""
+        tags = []
+        if self.is_superscript:
+            tags.append("<sup>")
+        if self.is_subscript:
+            tags.append("<sub>")
+        if self.is_bold:
+            tags.append("<b>")
+        if self.is_italic:
+            tags.append("<i>")
+        return "".join(tags)
+    
+    def to_html_close_tag(self) -> str:
+        """Generate closing HTML tags (reverse order)."""
+        tags = []
+        if self.is_italic:
+            tags.append("</i>")
+        if self.is_bold:
+            tags.append("</b>")
+        if self.is_subscript:
+            tags.append("</sub>")
+        if self.is_superscript:
+            tags.append("</sup>")
+        return "".join(tags)
+
+
+@dataclass
+class LineFormatInfo:
+    """
+    Complete formatting information for a line, preserving span-level details.
+    
+    This replaces the old line_data dict with a proper structure that
+    maintains full span information for intelligent format mapping.
+    """
+    text: str
+    spans: List[SpanFormat]
+    merged_bbox: Tuple[float, float, float, float]
+    rotation: int = 0
+    wmode: int = 0
+    
+    @property
+    def avg_size(self) -> float:
+        """Average font size across all spans."""
+        if not self.spans:
+            return 11.0
+        total_chars = sum(s.char_count for s in self.spans)
+        if total_chars == 0:
+            return sum(s.size for s in self.spans) / len(self.spans)
+        return sum(s.size * s.char_count for s in self.spans) / total_chars
+    
+    @property
+    def dominant_color(self) -> Tuple[float, float, float]:
+        """Most common color in the line (by character count)."""
+        if not self.spans:
+            return (0, 0, 0)
+        color_chars: Dict[Tuple, int] = {}
+        for span in self.spans:
+            key = span.color
+            color_chars[key] = color_chars.get(key, 0) + span.char_count
+        return max(color_chars.keys(), key=lambda c: color_chars[c])
+    
+    @property
+    def has_mixed_formatting(self) -> bool:
+        """Check if line has multiple different formatting styles."""
+        if len(self.spans) <= 1:
+            return False
+        first_key = self.spans[0].format_key()
+        return any(s.format_key() != first_key for s in self.spans[1:])
+    
+    @property
+    def is_bold(self) -> bool:
+        """Check if majority of text is bold."""
+        if not self.spans:
+            return False
+        bold_chars = sum(s.char_count for s in self.spans if s.is_bold)
+        total_chars = sum(s.char_count for s in self.spans)
+        return bold_chars > total_chars / 2 if total_chars > 0 else False
+    
+    @property
+    def is_italic(self) -> bool:
+        """Check if majority of text is italic."""
+        if not self.spans:
+            return False
+        italic_chars = sum(s.char_count for s in self.spans if s.is_italic)
+        total_chars = sum(s.char_count for s in self.spans)
+        return italic_chars > total_chars / 2 if total_chars > 0 else False
+    
+    @property
+    def is_monospace(self) -> bool:
+        """Check if any span is monospace."""
+        return any(s.is_monospace for s in self.spans)
+    
+    @property
+    def is_serif(self) -> bool:
+        """Check if majority of text is serif."""
+        if not self.spans:
+            return False
+        serif_chars = sum(s.char_count for s in self.spans if s.is_serif)
+        total_chars = sum(s.char_count for s in self.spans)
+        return serif_chars > total_chars / 2 if total_chars > 0 else False
+    
+    def get_formatting_segments(self) -> List[Tuple[str, SpanFormat]]:
+        """
+        Get list of (text, format) pairs for each span.
+        Consecutive spans with same formatting are merged.
+        """
+        if not self.spans:
+            return []
+        
+        segments = []
+        current_format = self.spans[0]
+        current_text = self.spans[0].text
+        
+        for span in self.spans[1:]:
+            if span.format_key() == current_format.format_key():
+                # Same formatting, merge text
+                current_text += " " + span.text
+            else:
+                # Different formatting, save current and start new
+                segments.append((current_text, current_format))
+                current_format = span
+                current_text = span.text
+        
+        # Don't forget the last segment
+        segments.append((current_text, current_format))
+        return segments
+    
+    def to_legacy_dict(self) -> dict:
+        """
+        Convert to legacy line_data dict format for backward compatibility.
+        This allows gradual migration of the codebase.
+        """
+        return {
+            'text': self.text,
+            'bboxes': [s.bbox for s in self.spans],
+            'sizes': [s.size for s in self.spans],
+            'fonts': [s.font for s in self.spans],
+            'colors': [s.color for s in self.spans],
+            'dominant_color': self.dominant_color,
+            'merged_bbox': self.merged_bbox,
+            'avg_size': self.avg_size,
+            'is_bold': self.is_bold,
+            'is_italic': self.is_italic,
+            'is_serif': self.is_serif,
+            'is_monospace': self.is_monospace,
+            'rotation': self.rotation,
+            'wmode': self.wmode,
+            # NEW: Include span-level info for intelligent formatting
+            'spans': self.spans,
+            'has_mixed_formatting': self.has_mixed_formatting,
+        }
+
+
+def map_formatting_to_translation(
+    original_segments: List[Tuple[str, SpanFormat]],
+    translated_text: str
+) -> str:
+    """
+    Intelligently map original formatting to translated text.
+    
+    This is the core algorithm for preserving inline formatting.
+    It uses multiple strategies to apply bold/italic/color
+    to the appropriate parts of the translated text.
+    
+    Strategies (in order of preference):
+    1. KEYWORD MATCHING: If a formatted segment is a single word that appears
+       (or has a similar form) in the translation, format that word directly.
+    2. PROPORTIONAL MAPPING: Distribute formatting based on word ratios.
+    
+    Args:
+        original_segments: List of (text, SpanFormat) from original line
+        translated_text: The translated text to apply formatting to
+        
+    Returns:
+        HTML-formatted string with inline formatting preserved
+    """
+    if not original_segments:
+        return translated_text
+    
+    # Single segment with no special formatting = no HTML needed
+    if len(original_segments) == 1:
+        fmt = original_segments[0][1]
+        if not fmt.is_bold and not fmt.is_italic:
+            return translated_text
+        # Apply full formatting
+        return fmt.to_html_open_tag() + _escape_html(translated_text) + fmt.to_html_close_tag()
+    
+    # Merge consecutive segments with same formatting for cleaner output
+    merged_segments = _merge_adjacent_formats(original_segments)
+    
+    # If all merged into one, check if we need formatting
+    if len(merged_segments) == 1:
+        fmt = merged_segments[0][1]
+        if not fmt.is_bold and not fmt.is_italic:
+            return translated_text
+        return fmt.to_html_open_tag() + _escape_html(translated_text) + fmt.to_html_close_tag()
+    
+    # STRATEGY 1: Try keyword matching for single-word formatted segments
+    result = _try_keyword_matching(merged_segments, translated_text)
+    if result is not None:
+        return result
+    
+    # STRATEGY 2: Proportional word-based mapping
+    return _proportional_word_mapping(merged_segments, translated_text)
+
+
+def _try_keyword_matching(
+    segments: List[Tuple[str, SpanFormat]],
+    translated_text: str
+) -> Optional[str]:
+    """
+    Try to match formatted keywords in the translated text.
+    
+    This works best when:
+    - A formatted segment is a single word or short phrase
+    - That word/phrase appears (or is similar) in the translation
+    - Common for technical terms, proper nouns, emphasized words
+    
+    Returns:
+        HTML-formatted string if matching successful, None otherwise
+    """
+    translated_words = translated_text.split()
+    translated_lower = translated_text.lower()
+    
+    # Find formatted segments that are single words or short phrases
+    formatted_segments = [
+        (text, fmt, i) for i, (text, fmt) in enumerate(segments)
+        if (fmt.is_bold or fmt.is_italic) and len(text.split()) <= 3
+    ]
+    
+    if not formatted_segments:
+        return None
+    
+    # Track which translated words should be formatted
+    word_formats: Dict[int, SpanFormat] = {}
+    matched_any = False
+    
+    for orig_text, fmt, seg_idx in formatted_segments:
+        orig_lower = orig_text.lower().strip()
+        orig_words = orig_text.split()
+        
+        # Try to find matching words in translation
+        for t_idx, t_word in enumerate(translated_words):
+            t_lower = t_word.lower().strip('.,;:!?"\'"()-')
+            
+            # Match strategies:
+            # 1. Exact match (case-insensitive)
+            # 2. Start match (translated word starts with original)
+            # 3. Original is contained in translation
+            if (t_lower == orig_lower or
+                t_lower.startswith(orig_lower[:min(4, len(orig_lower))]) or
+                orig_lower in t_lower or
+                _is_similar_word(orig_lower, t_lower)):
+                
+                if t_idx not in word_formats:
+                    word_formats[t_idx] = fmt
+                    matched_any = True
+                    break  # Found a match for this segment
+    
+    if not matched_any:
+        return None
+    
+    # Build output with matched formatting
+    result_parts = []
+    current_fmt = None
+    current_words = []
+    
+    for i, word in enumerate(translated_words):
+        fmt = word_formats.get(i)
+        
+        if fmt is not None:
+            # This word has formatting
+            if current_words:
+                # Flush previous unformatted words
+                result_parts.append(_escape_html(" ".join(current_words)))
+                current_words = []
+            
+            # Add formatted word
+            result_parts.append(fmt.to_html_open_tag() + _escape_html(word) + fmt.to_html_close_tag())
+        else:
+            # Unformatted word
+            current_words.append(word)
+    
+    # Flush remaining words
+    if current_words:
+        result_parts.append(_escape_html(" ".join(current_words)))
+    
+    return " ".join(result_parts)
+
+
+def _is_similar_word(word1: str, word2: str) -> bool:
+    """
+    Check if two words are similar (for matching across languages).
+    
+    Handles:
+    - Similar roots (import -> importante)
+    - Shared prefix of sufficient length
+    """
+    if not word1 or not word2:
+        return False
+    
+    # Minimum 4 char shared prefix for similarity
+    min_len = min(len(word1), len(word2))
+    if min_len < 3:
+        return False
+    
+    prefix_len = min(6, min_len)
+    return word1[:prefix_len] == word2[:prefix_len]
+
+
+def _proportional_word_mapping(
+    merged_segments: List[Tuple[str, SpanFormat]],
+    translated_text: str
+) -> str:
+    """
+    Fallback: Distribute formatting proportionally based on word counts.
+    """
+    # Calculate word counts for each original segment
+    original_word_counts = [len(text.split()) for text, _ in merged_segments]
+    total_original_words = sum(original_word_counts)
+    
+    if total_original_words == 0:
+        return translated_text
+    
+    # Split translated text into words
+    translated_words = translated_text.split()
+    if not translated_words:
+        return translated_text
+    
+    total_translated_words = len(translated_words)
+    
+    # Calculate ideal word counts for each segment
+    ideal_distribution = []
+    for i, (orig_text, fmt) in enumerate(merged_segments):
+        proportion = original_word_counts[i] / total_original_words
+        ideal_count = proportion * total_translated_words
+        ideal_distribution.append(ideal_count)
+    
+    # Allocate words
+    word_distribution = []
+    allocated = 0
+    
+    for i, ideal in enumerate(ideal_distribution):
+        if i == len(ideal_distribution) - 1:
+            word_count = total_translated_words - allocated
+        else:
+            word_count = max(1, round(ideal))
+            max_available = total_translated_words - allocated - (len(ideal_distribution) - i - 1)
+            word_count = min(word_count, max_available)
+        
+        word_distribution.append(word_count)
+        allocated += word_count
+    
+    # Build HTML output
+    html_parts = []
+    word_idx = 0
+    
+    for i, (orig_text, fmt) in enumerate(merged_segments):
+        words_for_segment = word_distribution[i]
+        segment_words = translated_words[word_idx:word_idx + words_for_segment]
+        word_idx += words_for_segment
+        
+        if not segment_words:
+            continue
+        
+        segment_text = " ".join(segment_words)
+        
+        if fmt.is_bold or fmt.is_italic:
+            html_parts.append(fmt.to_html_open_tag() + _escape_html(segment_text) + fmt.to_html_close_tag())
+        else:
+            html_parts.append(_escape_html(segment_text))
+    
+    return " ".join(html_parts)
+
+
+def _merge_adjacent_formats(
+    segments: List[Tuple[str, SpanFormat]]
+) -> List[Tuple[str, SpanFormat]]:
+    """
+    Merge adjacent segments that have the same formatting.
+    
+    This simplifies the output by combining consecutive spans that
+    would produce identical HTML tags.
+    
+    Example:
+        [("Hello", bold), ("world", bold)] -> [("Hello world", bold)]
+    """
+    if len(segments) <= 1:
+        return segments
+    
+    merged = []
+    current_text, current_fmt = segments[0]
+    
+    for text, fmt in segments[1:]:
+        if fmt.format_key() == current_fmt.format_key():
+            # Same formatting, merge text
+            current_text = current_text + " " + text
+        else:
+            # Different formatting, save current and start new
+            merged.append((current_text, current_fmt))
+            current_text, current_fmt = text, fmt
+    
+    # Don't forget the last segment
+    merged.append((current_text, current_fmt))
+    return merged
+
+
+def _escape_html(text: str) -> str:
+    """Escape HTML special characters."""
+    return (text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;"))
+
+
+def detect_title_or_heading(line_info: LineFormatInfo, all_lines: List[LineFormatInfo]) -> bool:
+    """
+    Detect if a line is likely a title or heading.
+    
+    Heuristics:
+    - Larger font size than average
+    - Bold formatting
+    - All caps or title case
+    - Short length (headings are usually short)
+    - Centered position (if we have layout info)
+    
+    Args:
+        line_info: The line to analyze
+        all_lines: All lines in the block for comparison
+        
+    Returns:
+        True if the line appears to be a title/heading
+    """
+    if not all_lines:
+        return False
+    
+    # Calculate average size across all lines
+    avg_sizes = [l.avg_size for l in all_lines if l.avg_size > 0]
+    if not avg_sizes:
+        return False
+    
+    overall_avg_size = sum(avg_sizes) / len(avg_sizes)
+    
+    # Heading indicators
+    indicators = 0
+    
+    # 1. Larger font (at least 20% bigger than average)
+    if line_info.avg_size > overall_avg_size * 1.2:
+        indicators += 2
+    
+    # 2. Bold text
+    if line_info.is_bold:
+        indicators += 1
+    
+    # 3. Short text (less than 60 characters)
+    if len(line_info.text) < 60:
+        indicators += 1
+    
+    # 4. All caps or Title Case
+    text = line_info.text.strip()
+    if text.isupper() and len(text) > 3:
+        indicators += 2
+    elif text.istitle() and len(text.split()) <= 8:
+        indicators += 1
+    
+    # 5. No ending punctuation (headings often don't have periods)
+    if text and text[-1] not in '.!?;:':
+        indicators += 1
+    
+    return indicators >= 3
 
 try:
     from paddleocr import PaddleOCR
@@ -627,26 +1240,44 @@ class PDFProcessor:
         self, 
         page_num: int, 
         translator,
-        text_color: Tuple[float, float, float] = (0.8, 0, 0),
-        use_original_color: bool = False,
-        preserve_font_style: bool = True
+        text_color: Tuple[float, float, float] = (0, 0, 0),
+        use_original_color: bool = True,
+        preserve_font_style: bool = True,
+        preserve_line_breaks: bool = True
     ) -> pymupdf.Document:
         """
         World-class translation system with maximum fidelity to original.
         
         Architecture:
-        1. Phase 1: Extract all text structure and metadata
-        2. Phase 2: Translate entire blocks for maximum context
-        3. Phase 3: Sentence-aware distribution preserving semantic boundaries
+        1. Phase 1: Extract all text structure with SPAN-LEVEL formatting
+        2. Phase 2: Translate LINE BY LINE to preserve structure
+        3. Phase 3: Apply SPAN-LEVEL formatting to translated text
         4. Phase 4: Remove ALL original text via redaction (clean slate)
-        5. Phase 5: Insert translations with font/style preservation
+        5. Phase 5: Insert translations with inline formatting preserved
+        
+        LINE-BY-LINE TRANSLATION (preserve_line_breaks=True):
+        This mode translates each line independently, preserving the original
+        document structure. This is crucial for:
+        - Titles and headings on separate lines
+        - Lists and bullet points
+        - Tables and structured content
+        - Poetry and formatted text
+        
+        SPAN-LEVEL FORMATTING:
+        Tracks formatting at the span level (individual text segments within a line).
+        This allows proper preservation of:
+        - Inline bold (e.g., "This is **important** text")
+        - Inline italic (e.g., "See the *definition* here")
+        - Mixed formatting within the same line
+        - Color changes for emphasis
         
         Args:
             page_num: Page number to translate
             translator: Translation engine instance
-            text_color: RGB color tuple for translated text (default red)
-            use_original_color: If True, use the original text color instead
+            text_color: RGB color tuple for translated text (default black)
+            use_original_color: If True, use the original text color instead (default True)
             preserve_font_style: If True, match original font family style
+            preserve_line_breaks: If True, translate line by line (default True)
             
         Returns:
             New document containing translated page
@@ -667,134 +1298,320 @@ class PDFProcessor:
         translated_count = 0
         total_blocks = len([b for b in text_dict.get("blocks", []) if "lines" in b])
         
-        logging.info(f"Page {page_num + 1}: Found {total_blocks} text blocks to process")
+        logging.info(f"Page {page_num + 1}: Found {total_blocks} text blocks to process (preserve_line_breaks={preserve_line_breaks})")
         
         # ============================================
-        # PHASE 1: Extract structure and translate
+        # PHASE 0: Pre-merge single-line blocks into paragraph groups
         # ============================================
-        for block_idx, block in enumerate(text_dict.get("blocks", [])):
-            if "lines" not in block:
-                continue
+        # Many PDFs have each line as a separate block, which defeats paragraph-level
+        # translation. We first merge adjacent blocks that belong to the same paragraph.
+        merged_block_groups = self._merge_single_line_blocks(text_dict)
+        
+        # ============================================
+        # PHASE 1: Extract structure with SPAN-LEVEL formatting
+        # ============================================
+        for group_idx, block_group in enumerate(merged_block_groups):
+            # Collect lines_info from ALL blocks in this group
+            lines_info: List[LineFormatInfo] = []
             
-            # Extract block structure preserving all metadata
-            lines_data = []
-            block_full_text = []
-            
-            logging.debug(f"Block {block_idx + 1}/{total_blocks}: Processing {len(block.get('lines', []))} lines")
-            
-            for line in block["lines"]:
-                if "spans" not in line:
-                    continue
+            for block_data in block_group:
+                block = block_data['block']
                 
-                line_text_parts = []
-                line_bboxes = []
-                line_sizes = []
-                line_fonts = []
-                line_colors = []
-                line_flags = []
-                
-                for span in line["spans"]:
-                    text = span.get("text", "").strip()
-                    if text:
-                        line_text_parts.append(text)
-                        line_bboxes.append(span["bbox"])
-                        line_sizes.append(span.get("size", 11))
-                        line_fonts.append(span.get("font", ""))
+                for line in block.get("lines", []):
+                    if "spans" not in line:
+                        continue
+                    
+                    # Extract text direction for rotation support
+                    line_dir = line.get("dir", (1, 0))  # Default: horizontal left-to-right
+                    line_wmode = line.get("wmode", 0)   # 0 = horizontal, 1 = vertical
+                    
+                    # Calculate rotation angle from direction vector
+                    cos_val, neg_sin_val = line_dir
+                    angle_rad = math.atan2(-neg_sin_val, cos_val)
+                    angle_deg = math.degrees(angle_rad)
+                    rotation = round(angle_deg / 90) * 90
+                    rotation = int(rotation) % 360
+                    
+                    # Create SpanFormat objects for each span
+                    span_formats: List[SpanFormat] = []
+                    line_bboxes = []
+                    
+                    # First pass: collect sizes and origins to calculate line averages
+                    span_data = []
+                    for span in line["spans"]:
+                        text = span.get("text", "").strip()
+                        if text:
+                            bbox = span["bbox"]
+                            size = span.get("size", 11)
+                            origin = span.get("origin", (bbox[0], bbox[3]))  # Default to bottom-left
+                            origin_y = origin[1] if origin else bbox[3]
+                            span_data.append({
+                                "span": span,
+                                "text": text,
+                                "bbox": bbox,
+                                "size": size,
+                                "origin_y": origin_y
+                            })
+                    
+                    # Calculate line average size (for superscript/subscript detection)
+                    if span_data:
+                        all_sizes = [d["size"] for d in span_data]
+                        line_avg_size = sum(all_sizes) / len(all_sizes)
+                        
+                        # Calculate baseline origin_y from normal-sized spans
+                        normal_spans = [d for d in span_data if d["size"] >= line_avg_size * 0.8]
+                        if normal_spans:
+                            line_origin_y = sum(d["origin_y"] for d in normal_spans) / len(normal_spans)
+                        else:
+                            line_origin_y = sum(d["origin_y"] for d in span_data) / len(span_data)
+                    else:
+                        line_avg_size = 11
+                        line_origin_y = 0
+                    
+                    # Second pass: create SpanFormat objects with baseline info
+                    for data in span_data:
+                        span = data["span"]
+                        bbox = data["bbox"]
+                        line_bboxes.append(bbox)
+                        
+                        # Extract color from integer
                         color_int = span.get("color", 0)
                         r = ((color_int >> 16) & 0xFF) / 255.0
                         g = ((color_int >> 8) & 0xFF) / 255.0
                         b = (color_int & 0xFF) / 255.0
-                        line_colors.append((r, g, b))
-                        line_flags.append(span.get("flags", 0))
-                
-                if line_text_parts:
-                    line_text = " ".join(line_text_parts)
-                    dominant_color = line_colors[0] if line_colors else (0, 0, 0)
-                    combined_flags = 0
-                    for f in line_flags:
-                        combined_flags |= f
+                        
+                        span_format = SpanFormat(
+                            text=data["text"],
+                            bbox=bbox,
+                            size=data["size"],
+                            font=span.get("font", ""),
+                            color=(r, g, b),
+                            flags=span.get("flags", 0),
+                            line_avg_size=line_avg_size,
+                            origin_y=data["origin_y"],
+                            line_origin_y=line_origin_y
+                        )
+                        span_formats.append(span_format)
                     
-                    line_data = {
-                        'text': line_text,
-                        'bboxes': line_bboxes,
-                        'sizes': line_sizes,
-                        'fonts': line_fonts,
-                        'colors': line_colors,
-                        'dominant_color': dominant_color,
-                        'merged_bbox': self._merge_bboxes(line_bboxes),
-                        'avg_size': sum(line_sizes) / len(line_sizes),
-                        'is_bold': any('Bold' in f for f in line_fonts) or (combined_flags & 16),
-                        'is_italic': any('Italic' in f for f in line_fonts) or (combined_flags & 2),
-                        'is_serif': any(f in font for font in line_fonts for f in ['Times', 'Serif', 'Georgia', 'Garamond']),
-                        'is_monospace': any(f in font for font in line_fonts for f in ['Courier', 'Mono', 'Consolas']),
-                    }
-                    lines_data.append(line_data)
-                    block_full_text.append(line_text)
-                    
-                    # Collect ALL bboxes for redaction
-                    for bbox in line_bboxes:
-                        areas_to_redact.append(bbox)
+                    if span_formats:
+                        line_text = " ".join(s.text for s in span_formats)
+                        merged_bbox = self._merge_bboxes(line_bboxes)
+                        
+                        line_info = LineFormatInfo(
+                            text=line_text,
+                            spans=span_formats,
+                            merged_bbox=merged_bbox,
+                            rotation=rotation,
+                            wmode=line_wmode
+                        )
+                        lines_info.append(line_info)
+                        
+                        # Collect ALL bboxes for redaction
+                        for bbox in line_bboxes:
+                            areas_to_redact.append(bbox)
             
-            if not lines_data:
+            if not lines_info:
                 continue
             
-            # Translate entire block for maximum context
-            block_text = " ".join(block_full_text)
+            # Log if block has mixed formatting (useful for debugging)
+            mixed_lines = [l for l in lines_info if l.has_mixed_formatting]
+            if mixed_lines:
+                logging.debug(f"Block has {len(mixed_lines)} lines with mixed inline formatting")
             
-            logging.debug(f"Block has {len(lines_data)} lines, text: {block_text[:100]}...")
+            # ============================================
+            # PHASE 2: Translate - PARAGRAPH BY PARAGRAPH
+            # ============================================
+            # Group lines into logical paragraphs, then translate each paragraph.
+            # A paragraph break occurs when:
+            # - The previous line ends with sentence-ending punctuation (. ! ? :)
+            # - There's a significant font size change (likely a heading)
+            # - The line is very short and looks like a title
+            # - The line is bold/different style from surrounding lines
             
-            try:
-                translated_block = translator.translate(block_text)
+            if preserve_line_breaks:
+                # Group lines into logical paragraphs
+                paragraphs = self._group_lines_into_paragraphs(lines_info)
                 
-                logging.debug(f"Translated to: {translated_block[:100] if translated_block else 'EMPTY'}...")
+                logging.debug(f"Block split into {len(paragraphs)} logical paragraph(s)")
                 
-                if not translated_block or not translated_block.strip():
-                    # Fallback: translate line by line
-                    logging.info(f"Empty block translation, using line-by-line fallback")
-                    for line_data in lines_data:
-                        line_trans = translator.translate(line_data['text']) or line_data['text']
-                        translations_to_insert.append({
-                            'line_data': line_data,
-                            'text': line_trans
-                        })
-                        translated_count += 1
-                    continue
+                for para_lines in paragraphs:
+                    if not para_lines:
+                        continue
+                    
+                    # Single line paragraph - translate directly
+                    if len(para_lines) == 1:
+                        line_info = para_lines[0]
+                        try:
+                            line_trans = translator.translate(line_info.text)
+                            if not line_trans or not line_trans.strip():
+                                line_trans = line_info.text
+                            
+                            formatted_text = self._apply_span_formatting(
+                                line_info, line_trans, use_original_color
+                            )
+                            translations_to_insert.append({
+                                'line_info': line_info,
+                                'line_data': line_info.to_legacy_dict(),
+                                'text': line_trans,
+                                'formatted_html': formatted_text,
+                                'use_html': line_info.has_mixed_formatting
+                            })
+                            translated_count += 1
+                        except Exception as e:
+                            logging.error(f"Line translation error: {e}")
+                            translations_to_insert.append({
+                                'line_info': line_info,
+                                'line_data': line_info.to_legacy_dict(),
+                                'text': line_info.text,
+                                'formatted_html': line_info.text,
+                                'use_html': False
+                            })
+                            translated_count += 1
+                    else:
+                        # Multi-line paragraph - translate together, then distribute
+                        para_text = " ".join(li.text for li in para_lines)
+                        
+                        try:
+                            translated_para = translator.translate(para_text)
+                            
+                            if not translated_para or not translated_para.strip():
+                                # Fallback: translate each line separately
+                                for line_info in para_lines:
+                                    line_trans = translator.translate(line_info.text) or line_info.text
+                                    formatted_text = self._apply_span_formatting(
+                                        line_info, line_trans, use_original_color
+                                    )
+                                    translations_to_insert.append({
+                                        'line_info': line_info,
+                                        'line_data': line_info.to_legacy_dict(),
+                                        'text': line_trans,
+                                        'formatted_html': formatted_text,
+                                        'use_html': line_info.has_mixed_formatting
+                                    })
+                                    translated_count += 1
+                                continue
+                            
+                            # Distribute translated text across original lines
+                            translated_sentences = split_into_sentences(translated_para)
+                            original_line_lengths = [len(li.text) for li in para_lines]
+                            line_texts = align_sentences_to_lines(
+                                translated_sentences,
+                                len(para_lines),
+                                original_line_lengths
+                            )
+                            
+                            for line_info, line_text in zip(para_lines, line_texts):
+                                if line_text.strip():
+                                    formatted_text = self._apply_span_formatting(
+                                        line_info, line_text, use_original_color
+                                    )
+                                    translations_to_insert.append({
+                                        'line_info': line_info,
+                                        'line_data': line_info.to_legacy_dict(),
+                                        'text': line_text,
+                                        'formatted_html': formatted_text,
+                                        'use_html': line_info.has_mixed_formatting
+                                    })
+                                    translated_count += 1
+                        
+                        except Exception as e:
+                            logging.error(f"Paragraph translation error: {e}")
+                            # Fallback: translate each line separately
+                            for line_info in para_lines:
+                                try:
+                                    line_trans = translator.translate(line_info.text) or line_info.text
+                                    formatted_text = self._apply_span_formatting(
+                                        line_info, line_trans, use_original_color
+                                    )
+                                    translations_to_insert.append({
+                                        'line_info': line_info,
+                                        'line_data': line_info.to_legacy_dict(),
+                                        'text': line_trans,
+                                        'formatted_html': formatted_text,
+                                        'use_html': line_info.has_mixed_formatting
+                                    })
+                                    translated_count += 1
+                                except:
+                                    translations_to_insert.append({
+                                        'line_info': line_info,
+                                        'line_data': line_info.to_legacy_dict(),
+                                        'text': line_info.text,
+                                        'formatted_html': line_info.text,
+                                        'use_html': False
+                                    })
+                                    translated_count += 1
+            else:
+                # LEGACY MODE: Translate entire block, then redistribute
+                # (Kept for backward compatibility, but not recommended)
+                block_full_text = [li.text for li in lines_info]
+                block_text = " ".join(block_full_text)
                 
-                # Sentence-aware distribution
-                translated_sentences = split_into_sentences(translated_block)
-                original_line_lengths = [len(line['text']) for line in lines_data]
-                line_texts = align_sentences_to_lines(
-                    translated_sentences,
-                    len(lines_data),
-                    original_line_lengths
-                )
+                logging.debug(f"Block has {len(lines_info)} lines, text: {block_text[:100]}...")
                 
-                logging.debug(f"Sentence-aware distribution: {len(translated_sentences)} sentences → {len(lines_data)} lines")
-                
-                # Queue translations for later insertion
-                for line_data, line_text in zip(lines_data, line_texts):
-                    if line_text.strip():
-                        translations_to_insert.append({
-                            'line_data': line_data,
-                            'text': line_text
-                        })
-                        translated_count += 1
-                
-            except Exception as e:
-                logging.error(f"Block translation error: {e}, using line-by-line fallback")
-                for line_data in lines_data:
-                    try:
-                        line_trans = translator.translate(line_data['text'])
-                        translations_to_insert.append({
-                            'line_data': line_data,
-                            'text': line_trans or line_data['text']
-                        })
-                        translated_count += 1
-                    except Exception as line_error:
-                        logging.error(f"Line translation failed: {line_error}")
+                try:
+                    translated_block = translator.translate(block_text)
+                    
+                    if not translated_block or not translated_block.strip():
+                        # Fallback to line by line
+                        for line_info in lines_info:
+                            line_trans = translator.translate(line_info.text) or line_info.text
+                            formatted_text = self._apply_span_formatting(
+                                line_info, line_trans, use_original_color
+                            )
+                            translations_to_insert.append({
+                                'line_info': line_info,
+                                'line_data': line_info.to_legacy_dict(),
+                                'text': line_trans,
+                                'formatted_html': formatted_text,
+                                'use_html': line_info.has_mixed_formatting
+                            })
+                            translated_count += 1
+                        continue
+                    
+                    # Sentence-aware distribution
+                    translated_sentences = split_into_sentences(translated_block)
+                    original_line_lengths = [len(li.text) for li in lines_info]
+                    line_texts = align_sentences_to_lines(
+                        translated_sentences,
+                        len(lines_info),
+                        original_line_lengths
+                    )
+                    
+                    for line_info, line_text in zip(lines_info, line_texts):
+                        if line_text.strip():
+                            formatted_text = self._apply_span_formatting(
+                                line_info, line_text, use_original_color
+                            )
+                            translations_to_insert.append({
+                                'line_info': line_info,
+                                'line_data': line_info.to_legacy_dict(),
+                                'text': line_text,
+                                'formatted_html': formatted_text,
+                                'use_html': line_info.has_mixed_formatting
+                            })
+                            translated_count += 1
+                    
+                except Exception as e:
+                    logging.error(f"Block translation error: {e}, using line-by-line fallback")
+                    for line_info in lines_info:
+                        try:
+                            line_trans = translator.translate(line_info.text)
+                            formatted_text = self._apply_span_formatting(
+                                line_info, line_trans or line_info.text, use_original_color
+                            )
+                            translations_to_insert.append({
+                                'line_info': line_info,
+                                'line_data': line_info.to_legacy_dict(),
+                                'text': line_trans or line_info.text,
+                                'formatted_html': formatted_text,
+                                'use_html': line_info.has_mixed_formatting
+                            })
+                            translated_count += 1
+                        except Exception as line_error:
+                            logging.error(f"Line translation failed: {line_error}")
         
         # ============================================
-        # PHASE 2: Apply redactions (remove ALL original text)
+        # PHASE 3: Apply redactions (remove ALL original text)
         # ============================================
         logging.info(f"Applying {len(areas_to_redact)} redactions to remove original text...")
         
@@ -811,21 +1628,33 @@ class PDFProcessor:
         logging.info(f"Redactions applied successfully")
         
         # ============================================
-        # PHASE 3: Insert translations
+        # PHASE 3: Insert translations with SPAN-LEVEL formatting
         # ============================================
         logging.info(f"Inserting {len(translations_to_insert)} translations...")
         
         for item in translations_to_insert:
             try:
-                self._insert_line_translation(
-                    page, 
-                    item['line_data'], 
-                    item['text'],
-                    text_color,
-                    use_original_color=use_original_color,
-                    preserve_font_style=preserve_font_style,
-                    skip_clearing=True  # Already cleared via redaction
-                )
+                # Use new span-aware insertion if mixed formatting, else use legacy
+                if item.get('use_html') and item.get('formatted_html'):
+                    self._insert_formatted_translation(
+                        page,
+                        item['line_info'],
+                        item['formatted_html'],
+                        text_color,
+                        use_original_color=use_original_color,
+                        preserve_font_style=preserve_font_style
+                    )
+                else:
+                    # Legacy method for simple formatting
+                    self._insert_line_translation(
+                        page, 
+                        item['line_data'], 
+                        item['text'],
+                        text_color,
+                        use_original_color=use_original_color,
+                        preserve_font_style=preserve_font_style,
+                        skip_clearing=True  # Already cleared via redaction
+                    )
             except Exception as e:
                 logging.error(f"Failed to insert translation: {e}")
         
@@ -835,6 +1664,410 @@ class PDFProcessor:
             logging.warning(f"Page {page_num + 1}: NO LINES TRANSLATED! This page may appear blank.")
         
         return new_doc
+    
+    def _apply_span_formatting(
+        self,
+        line_info: LineFormatInfo,
+        translated_text: str,
+        use_original_color: bool = True
+    ) -> str:
+        """
+        Apply original span-level formatting to translated text.
+        
+        This is the intelligent formatting mapper that preserves inline styles
+        (bold, italic, color) from the original text and applies them
+        proportionally to the translated text.
+        
+        Algorithm:
+        1. Get formatting segments from original line
+        2. If no mixed formatting, return plain text (no HTML needed)
+        3. Otherwise, use proportional mapping to apply formatting
+        
+        Args:
+            line_info: Original line with span-level formatting info
+            translated_text: The translated text to format
+            use_original_color: Whether to preserve original colors
+            
+        Returns:
+            HTML-formatted string if mixed formatting, else plain text
+        """
+        if not line_info.has_mixed_formatting:
+            # No mixed formatting = no HTML needed
+            return translated_text
+        
+        # Get formatting segments (consecutive spans with same formatting merged)
+        segments = line_info.get_formatting_segments()
+        
+        if not segments:
+            return translated_text
+        
+        # Use the intelligent formatting mapper
+        formatted = map_formatting_to_translation(segments, translated_text)
+        
+        logging.debug(f"Applied span formatting: '{translated_text[:50]}...' -> '{formatted[:60]}...'")
+        
+        return formatted
+    
+    def _insert_formatted_translation(
+        self,
+        page: pymupdf.Page,
+        line_info: LineFormatInfo,
+        formatted_html: str,
+        text_color: Tuple[float, float, float],
+        use_original_color: bool = True,
+        preserve_font_style: bool = True
+    ) -> None:
+        """
+        Insert translated text with span-level HTML formatting.
+        
+        This method handles lines that have mixed inline formatting
+        (e.g., some words bold, some italic) by using HTML rendering.
+        
+        For simple formatting (all bold, all italic, etc.), use
+        _insert_line_translation instead.
+        
+        Args:
+            page: PyMuPDF page to insert text into
+            line_info: LineFormatInfo with original formatting data
+            formatted_html: HTML-formatted translation text
+            text_color: Default text color (used if not preserving original)
+            use_original_color: Whether to use original text colors
+            preserve_font_style: Whether to preserve font family style
+        """
+        merged_bbox = line_info.merged_bbox
+        bbox_width = merged_bbox[2] - merged_bbox[0]
+        bbox_height = merged_bbox[3] - merged_bbox[1]
+        
+        if bbox_width <= 0 or bbox_height <= 0:
+            logging.warning(f"Invalid bbox dimensions: {merged_bbox}")
+            return
+        
+        # Determine base color (dominant color from original or specified)
+        if use_original_color:
+            base_color = line_info.dominant_color
+        else:
+            base_color = text_color
+        
+        # Calculate optimal font size
+        target_font_size = line_info.avg_size
+        
+        # Determine font family based on original
+        if preserve_font_style:
+            if line_info.is_monospace:
+                font_family = '"Courier New", Courier, monospace'
+                char_width_factor = 0.6
+            elif line_info.is_serif:
+                font_family = 'Georgia, "Times New Roman", Times, serif'
+                char_width_factor = 0.5
+            else:
+                font_family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif'
+                char_width_factor = 0.52
+        else:
+            font_family = 'Helvetica, Arial, sans-serif'
+            char_width_factor = 0.52
+        
+        # Strip HTML tags for width calculation
+        plain_text = re.sub(r'<[^>]+>', '', formatted_html)
+        plain_text = plain_text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
+        
+        # Character width estimation
+        avg_char_width = target_font_size * char_width_factor
+        estimated_width = len(plain_text) * avg_char_width
+        
+        # Determine if we need text wrapping
+        needs_wrapping = estimated_width > bbox_width * 1.5
+        
+        # IMPORTANT: Keep original font size - do NOT scale
+        # The original size is preserved to maintain document appearance
+        # If text doesn't fit, we use wrapping instead of shrinking
+        if estimated_width > bbox_width and not needs_wrapping:
+            # Allow wrapping for long text rather than shrinking
+            needs_wrapping = True
+        
+        # Get rotation from line_info
+        rotation = line_info.rotation
+        
+        # Build CSS
+        css_color = f"rgb({int(base_color[0]*255)}, {int(base_color[1]*255)}, {int(base_color[2]*255)})"
+        
+        # Determine base font weight and style (can be overridden by HTML tags)
+        base_weight = 'bold' if line_info.is_bold and '<b>' not in formatted_html else 'normal'
+        base_style = 'italic' if line_info.is_italic and '<i>' not in formatted_html else 'normal'
+        
+        if needs_wrapping:
+            white_space = "normal"
+            word_wrap = "break-word"
+        else:
+            white_space = "nowrap"
+            word_wrap = "normal"
+        
+        css = f"""* {{
+            font-family: {font_family};
+            font-size: {target_font_size}pt;
+            color: {css_color};
+            font-weight: {base_weight};
+            font-style: {base_style};
+            line-height: 1.15;
+            padding: 0;
+            margin: 0;
+            white-space: {white_space};
+            word-wrap: {word_wrap};
+            font-variant-ligatures: none;
+            -webkit-font-variant-ligatures: none;
+            font-feature-settings: "liga" 0, "clig" 0;
+        }}
+        b {{ font-weight: bold; }}
+        i {{ font-style: italic; }}
+        sup {{ vertical-align: super; font-size: 0.7em; }}
+        sub {{ vertical-align: sub; font-size: 0.7em; }}
+        """
+        
+        try:
+            page.insert_htmlbox(merged_bbox, formatted_html, css=css, rotate=rotation)
+            logging.debug(f"✓ Formatted HTML insertion successful (rotation={rotation}°)")
+        except Exception as e:
+            logging.warning(f"Formatted HTML insertion failed: {e}, falling back to plain text")
+            # Fallback to plain text without formatting
+            try:
+                page.insert_htmlbox(merged_bbox, plain_text, css=css, rotate=rotation)
+            except Exception as e2:
+                logging.error(f"Plain text fallback also failed: {e2}")
+    
+    def _group_lines_into_paragraphs(
+        self, 
+        lines_info: List[LineFormatInfo]
+    ) -> List[List[LineFormatInfo]]:
+        """
+        Group lines into logical paragraphs for translation.
+        
+        This intelligently detects paragraph boundaries to ensure:
+        - Titles/headings are translated separately
+        - Paragraph text flows naturally within the group
+        - Structure is preserved when line breaks are meaningful
+        
+        Paragraph break indicators:
+        1. Previous line ends with sentence punctuation (. ! ? :)
+        2. Current line has significantly different font size (±20%)
+        3. Current line is bold when previous wasn't (or vice versa)
+        4. Current line is very short (< 40 chars) and looks like a title
+        5. There's significant vertical gap between lines
+        
+        Args:
+            lines_info: List of LineFormatInfo from a block
+            
+        Returns:
+            List of paragraph groups, each containing one or more lines
+        """
+        if not lines_info:
+            return []
+        
+        if len(lines_info) == 1:
+            return [lines_info]
+        
+        paragraphs: List[List[LineFormatInfo]] = []
+        current_para: List[LineFormatInfo] = [lines_info[0]]
+        
+        for i in range(1, len(lines_info)):
+            prev_line = lines_info[i - 1]
+            curr_line = lines_info[i]
+            
+            should_break = False
+            break_reason = ""
+            
+            # Check 1: Previous line ends with sentence-ending punctuation
+            prev_text = prev_line.text.strip()
+            if prev_text and prev_text[-1] in '.!?:':
+                # Check it's not an abbreviation (single letter before period)
+                words = prev_text.split()
+                if words:
+                    last_word = words[-1].rstrip('.!?:')
+                    # Not an abbreviation if word is long or all caps
+                    if len(last_word) > 2 or last_word.isupper():
+                        should_break = True
+                        break_reason = "sentence_end"
+            
+            # Check 2: Significant font size change (likely heading)
+            if not should_break:
+                size_ratio = curr_line.avg_size / prev_line.avg_size if prev_line.avg_size > 0 else 1
+                if size_ratio > 1.2 or size_ratio < 0.8:
+                    should_break = True
+                    break_reason = f"size_change ({size_ratio:.2f})"
+            
+            # Check 3: Bold status change (heading detection)
+            if not should_break:
+                if curr_line.is_bold != prev_line.is_bold:
+                    # Current line is bold (start of heading) or previous was bold (end of heading)
+                    should_break = True
+                    break_reason = "bold_change"
+            
+            # Check 4: Short line that looks like a title
+            if not should_break:
+                curr_text = curr_line.text.strip()
+                # Short, possibly title-case, no ending punctuation
+                if (len(curr_text) < 50 and 
+                    len(curr_text.split()) <= 6 and
+                    curr_text and 
+                    curr_text[-1] not in '.,;'):
+                    # Additional check: is it title case or all caps?
+                    if curr_text.istitle() or curr_text.isupper():
+                        should_break = True
+                        break_reason = "title_pattern"
+            
+            # Check 5: Vertical gap between lines
+            if not should_break:
+                prev_bottom = prev_line.merged_bbox[3]  # y1
+                curr_top = curr_line.merged_bbox[1]     # y0
+                gap = curr_top - prev_bottom
+                avg_height = (prev_line.avg_size + curr_line.avg_size) / 2
+                
+                # Gap larger than 1.5x the average font size suggests paragraph break
+                if gap > avg_height * 1.5:
+                    should_break = True
+                    break_reason = f"vertical_gap ({gap:.1f} > {avg_height * 1.5:.1f})"
+            
+            if should_break:
+                logging.debug(f"Paragraph break before line '{curr_line.text[:30]}...' reason: {break_reason}")
+                paragraphs.append(current_para)
+                current_para = [curr_line]
+            else:
+                current_para.append(curr_line)
+        
+        # Don't forget the last paragraph
+        if current_para:
+            paragraphs.append(current_para)
+        
+        return paragraphs
+    
+    def _merge_single_line_blocks(
+        self,
+        text_dict: Dict[str, Any]
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Merge adjacent single-line blocks into logical paragraph groups.
+        
+        Many PDFs (especially those from LaTeX) have each line as a separate block.
+        This defeats paragraph-level translation. This function pre-merges blocks
+        that should be translated together.
+        
+        Merge conditions (consecutive blocks are merged if ALL are true):
+        1. Previous block does NOT end with sentence punctuation (.!?)
+        2. Font size is similar (within 15%)
+        3. Font style (bold) is the same
+        4. Not a short title-like line
+        
+        Break conditions (start new paragraph):
+        1. Previous line ends with .!?
+        2. Significant font size change (heading)
+        3. Bold status changes
+        4. Current line looks like a title (short, title case, no ending punct)
+        
+        Args:
+            text_dict: The page text dictionary from get_text("dict")
+            
+        Returns:
+            List of block groups, where each group is a list of blocks
+            that should be translated together as one paragraph
+        """
+        # First collect all text blocks with their lines
+        text_blocks = []
+        for block in text_dict.get("blocks", []):
+            if "lines" not in block:
+                continue
+            
+            lines = block.get("lines", [])
+            if not lines:
+                continue
+            
+            # Get combined text from all spans in all lines
+            block_text = ""
+            for line in lines:
+                for span in line.get("spans", []):
+                    block_text += span.get("text", "")
+            
+            if not block_text.strip():
+                continue
+            
+            # Get formatting info from first span of first line
+            first_span = lines[0].get("spans", [{}])[0] if lines[0].get("spans") else {}
+            
+            text_blocks.append({
+                'block': block,
+                'text': block_text.strip(),
+                'font_size': first_span.get("size", 11),
+                'font': first_span.get("font", ""),
+                'is_bold': 'Bold' in first_span.get("font", "") or bool(first_span.get("flags", 0) & 16),
+                'bbox': block.get("bbox", [0, 0, 0, 0])
+            })
+        
+        if not text_blocks:
+            return []
+        
+        # Now merge consecutive blocks based on paragraph logic
+        merged_groups: List[List[Dict[str, Any]]] = []
+        current_group: List[Dict[str, Any]] = [text_blocks[0]]
+        
+        for i in range(1, len(text_blocks)):
+            prev = text_blocks[i - 1]
+            curr = text_blocks[i]
+            
+            should_merge = True
+            
+            # Check 1: Previous block ends with sentence punctuation
+            prev_text = prev['text'].rstrip()
+            if prev_text and prev_text[-1] in '.!?':
+                # Check it's not an abbreviation (e.g., "Dr." "Fig." "etc.")
+                words = prev_text.split()
+                if words:
+                    last_word = words[-1].rstrip('.!?')
+                    # Not an abbreviation if word is longer than 3 chars
+                    # or if it's all caps (likely acronym sentence end)
+                    if len(last_word) > 3 or (last_word.isupper() and len(last_word) > 1):
+                        should_merge = False
+            
+            # Check 2: Font size change (likely heading)
+            if should_merge:
+                size_ratio = curr['font_size'] / prev['font_size'] if prev['font_size'] > 0 else 1
+                if size_ratio > 1.15 or size_ratio < 0.85:
+                    should_merge = False
+            
+            # Check 3: Bold status change (heading detection)
+            if should_merge:
+                if curr['is_bold'] != prev['is_bold']:
+                    should_merge = False
+            
+            # Check 4: Short title-like line
+            if should_merge:
+                curr_text = curr['text']
+                # Short, title-case or all caps, no ending punctuation
+                if len(curr_text) < 50 and len(curr_text.split()) <= 8:
+                    if curr_text[-1] not in '.,;:':
+                        if curr_text.istitle() or curr_text.isupper():
+                            should_merge = False
+            
+            # Check 5: Significant vertical gap between blocks
+            if should_merge:
+                prev_bottom = prev['bbox'][3]  # y1
+                curr_top = curr['bbox'][1]      # y0
+                gap = curr_top - prev_bottom
+                avg_font_size = (prev['font_size'] + curr['font_size']) / 2
+                
+                # Gap larger than 2x font size suggests paragraph break
+                if gap > avg_font_size * 2:
+                    should_merge = False
+            
+            if should_merge:
+                current_group.append(curr)
+            else:
+                merged_groups.append(current_group)
+                current_group = [curr]
+        
+        # Don't forget the last group
+        if current_group:
+            merged_groups.append(current_group)
+        
+        logging.info(f"Cross-block merge: {len(text_blocks)} blocks → {len(merged_groups)} paragraph groups")
+        
+        return merged_groups
     
     def _merge_bboxes(self, bboxes: List[Tuple]) -> Tuple[float, float, float, float]:
         """Merge multiple bboxes into one encompassing bbox."""
@@ -992,32 +2225,50 @@ class PDFProcessor:
         # Determine if we need text wrapping
         needs_wrapping = estimated_width > bbox_width * 1.5
         
-        # Dynamic scaling with quality preservation
+        # IMPORTANT: Keep original font size - do NOT scale
+        # The original size is preserved to maintain document appearance
+        # If text doesn't fit, we use wrapping instead of shrinking
         if estimated_width > bbox_width and not needs_wrapping:
-            # Scale down to fit, but maintain readability
-            scale_factor = bbox_width / estimated_width
-            target_font_size = max(6, target_font_size * scale_factor * 0.95)
+            # Allow wrapping for long text rather than shrinking
+            needs_wrapping = True
         
-        # Ensure minimum readability
-        if target_font_size < 6:
-            logging.warning(f"Font size {target_font_size:.1f}pt too small, clamped to 6pt")
-            target_font_size = 6
+        # Get rotation from line_data (0, 90, 180, 270)
+        rotation = line_data.get('rotation', 0)
         
         # PRIMARY METHOD: Direct text insertion (no ligatures, reliable)
         # Only use htmlbox for wrapping since insert_text doesn't wrap
         if not needs_wrapping:
             try:
-                # Calculate baseline position
-                baseline_y = merged_bbox[1] + target_font_size
+                # Calculate insertion point based on rotation
+                if rotation == 0:
+                    # Normal horizontal: top-left, baseline below top
+                    insert_point = (merged_bbox[0], merged_bbox[1] + target_font_size)
+                elif rotation == 90:
+                    # Rotated 90° CCW (text goes up): bottom-left corner
+                    insert_point = (merged_bbox[0] + target_font_size, merged_bbox[3])
+                elif rotation == 180:
+                    # Upside down: bottom-right corner
+                    insert_point = (merged_bbox[2], merged_bbox[3] - target_font_size)
+                elif rotation == 270:
+                    # Rotated 270° CCW / 90° CW (text goes down): top-right corner
+                    insert_point = (merged_bbox[2] - target_font_size, merged_bbox[1])
+                else:
+                    # Fallback to standard
+                    insert_point = (merged_bbox[0], merged_bbox[1] + target_font_size)
                 
                 page.insert_text(
-                    (merged_bbox[0], baseline_y),
+                    insert_point,
                     translated_text,
                     fontsize=target_font_size,
                     color=final_color,
-                    fontname=pdf_font
+                    fontname=pdf_font,
+                    rotate=rotation
                 )
-                logging.debug(f"✓ Text insertion successful (primary)")
+                
+                if rotation != 0:
+                    logging.debug(f"✓ Rotated text insertion successful (rotation={rotation}°)")
+                else:
+                    logging.debug(f"✓ Text insertion successful (primary)")
                 return
                 
             except Exception as e:
@@ -1062,26 +2313,41 @@ class PDFProcessor:
                 font-feature-settings: "liga" 0, "clig" 0;
             }}"""
             
-            page.insert_htmlbox(merged_bbox, translated_text, css=css)
-            logging.debug(f"✓ HTML insertion successful (wrap={needs_wrapping})")
+            page.insert_htmlbox(merged_bbox, translated_text, css=css, rotate=rotation)
+            if rotation != 0:
+                logging.debug(f"✓ HTML insertion successful (wrap={needs_wrapping}, rotation={rotation}°)")
+            else:
+                logging.debug(f"✓ HTML insertion successful (wrap={needs_wrapping})")
             return
             
         except Exception as e:
             logging.warning(f"HTML insertion failed: {e}")
-            # Final fallback: truncated text
+            # Final fallback: truncated text (with rotation support)
             try:
-                baseline_y = merged_bbox[1] + target_font_size
+                # Calculate insertion point based on rotation (same as primary method)
+                if rotation == 0:
+                    insert_point = (merged_bbox[0], merged_bbox[1] + target_font_size)
+                elif rotation == 90:
+                    insert_point = (merged_bbox[0] + target_font_size, merged_bbox[3])
+                elif rotation == 180:
+                    insert_point = (merged_bbox[2], merged_bbox[3] - target_font_size)
+                elif rotation == 270:
+                    insert_point = (merged_bbox[2] - target_font_size, merged_bbox[1])
+                else:
+                    insert_point = (merged_bbox[0], merged_bbox[1] + target_font_size)
+                
                 max_chars = int(bbox_width / (target_font_size * 0.45))
                 display_text = translated_text[:max_chars-3] + "..." if len(translated_text) > max_chars else translated_text
                 
                 page.insert_text(
-                    (merged_bbox[0], baseline_y),
+                    insert_point,
                     display_text,
                     fontsize=target_font_size,
                     color=final_color,
-                    fontname=pdf_font
+                    fontname=pdf_font,
+                    rotate=rotation
                 )
-                logging.debug(f"✓ Truncated text insertion successful")
+                logging.debug(f"✓ Truncated text insertion successful (rotation={rotation}°)")
             except Exception as final_error:
                 logging.error(f"All insertion methods failed: {final_error}")
     

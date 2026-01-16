@@ -62,8 +62,9 @@ logging.basicConfig(
 
 # Constants
 COLOR_MAP = {
-    "Rosso": (0.8, 0, 0),
+    "Originale": None,  # Use original text color
     "Nero": (0, 0, 0),
+    "Rosso": (0.8, 0, 0),
     "Blu": (0, 0, 0.8),
     "Verde": (0, 0.5, 0),
     "Viola": (0.5, 0, 0.5),
@@ -174,7 +175,7 @@ class PDFTranslatorGUI:
         self.translator_type = tk.StringVar(value="Argos")
         self.source_lang = tk.StringVar(value="English")
         self.target_lang = tk.StringVar(value="Italiano")
-        self.text_color = tk.StringVar(value="Rosso")
+        self.text_color = tk.StringVar(value="Originale")
         
         # Setup UI
         self.setup_ui()
@@ -692,7 +693,9 @@ class PDFTranslatorGUI:
     
     def translate_page(self, page_num):
         WHITE = pymupdf.pdfcolor["white"]
-        rgb_color = COLOR_MAP.get(self.text_color.get(), COLOR_MAP["Rosso"])
+        color_setting = COLOR_MAP.get(self.text_color.get(), None)
+        use_original_color = color_setting is None  # "Originale" maps to None
+        default_color = (0, 0, 0)  # Black fallback
         translator = self.get_translator()
 
         new_doc = pymupdf.open()
@@ -724,12 +727,20 @@ class PDFTranslatorGUI:
                     if not span.get("text") or len(span["text"].strip()) < 1:
                         continue
                     
+                    # Extract original color from span
+                    color_int = span.get("color", 0)
+                    r = ((color_int >> 16) & 0xFF) / 255.0
+                    g = ((color_int >> 8) & 0xFF) / 255.0
+                    b = (color_int & 0xFF) / 255.0
+                    original_color = (r, g, b)
+                    
                     span_info = {
                         'bbox': span["bbox"],
                         'text': span["text"],
                         'size': span.get("size", 11),
                         'font': span.get("font", ""),
-                        'original_length': len(span["text"])
+                        'original_length': len(span["text"]),
+                        'original_color': original_color
                     }
                     line_info['spans'].append(span_info)
                     line_info['text'] += span["text"]
@@ -793,6 +804,12 @@ class PDFTranslatorGUI:
                             # Reduce font size to fit
                             font_size = max(6, (bbox_width / len(span_translated)) * 1.5)
                         
+                        # Determine color: original or selected
+                        if use_original_color:
+                            rgb_color = span_info.get('original_color', default_color)
+                        else:
+                            rgb_color = color_setting if color_setting else default_color
+                        
                         # Insert translated text
                         try:
                             is_bold = 'Bold' in span_info['font']
@@ -833,6 +850,8 @@ class PDFTranslatorGUI:
 
                 if len(clean_text) > 20:
                     translated_text = translator.translate(clean_text)
+                    # For OCR fallback, use black as default (no original color available)
+                    ocr_color = color_setting if color_setting else default_color
                     page.draw_rect(page.rect, color=None, fill=WHITE)
                     page.insert_htmlbox(
                         page.rect,
@@ -840,7 +859,7 @@ class PDFTranslatorGUI:
                         css=f"""* {{
                             font-family: sans-serif;
                             font-size: 10pt;
-                            color: rgb({int(rgb_color[0]*255)}, {int(rgb_color[1]*255)}, {int(rgb_color[2]*255)});
+                            color: rgb({int(ocr_color[0]*255)}, {int(ocr_color[1]*255)}, {int(ocr_color[2]*255)});
                         }}"""
                     )
                     translated_count += 1

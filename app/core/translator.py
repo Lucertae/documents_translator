@@ -97,8 +97,10 @@ def align_sentences_to_lines(
     """
     Intelligently distribute translated sentences across original line positions.
     
-    Uses a greedy algorithm that respects sentence boundaries while
-    trying to maintain proportional distribution.
+    Strategy:
+    - If sentences == lines: one sentence per line (ideal case)
+    - If sentences < lines: distribute words of all sentences across lines  
+    - If sentences > lines: merge sentences intelligently
     
     Args:
         translated_sentences: List of translated sentences
@@ -114,55 +116,44 @@ def align_sentences_to_lines(
     if num_lines <= 0:
         return [' '.join(translated_sentences)]
     
-    # Special case: more lines than sentences - distribute words across lines
+    # IDEAL CASE: same number of sentences as lines - direct mapping
+    if len(translated_sentences) == num_lines:
+        return translated_sentences.copy()
+    
+    # Case: fewer sentences than lines - distribute words evenly
     if len(translated_sentences) < num_lines:
-        # Join all sentences and distribute words proportionally
         all_text = ' '.join(translated_sentences)
         return _distribute_single_sentence(all_text, num_lines, original_line_lengths)
     
+    # Case: single sentence for multiple lines
     if len(translated_sentences) == 1:
-        # Single sentence: distribute words proportionally
         return _distribute_single_sentence(translated_sentences[0], num_lines, original_line_lengths)
     
-    # Calculate total lengths
-    total_original = sum(original_line_lengths) or 1
-    total_translated = sum(len(s) for s in translated_sentences)
+    # Case: more sentences than lines - merge sentences
+    # Strategy: distribute sentences as evenly as possible across lines
+    sentences_per_line = len(translated_sentences) / num_lines
     
-    # Greedy allocation: assign sentences to lines
     lines = []
     sentence_idx = 0
     
     for line_idx in range(num_lines):
-        line_parts = []
+        # Calculate how many sentences this line should have
+        start_idx = sentence_idx
         
-        # Target character count for this line (proportional)
-        target_chars = (original_line_lengths[line_idx] / total_original) * total_translated
-        current_chars = 0
+        if line_idx == num_lines - 1:
+            # Last line takes all remaining
+            end_idx = len(translated_sentences)
+        else:
+            # Calculate end index based on even distribution
+            target_end = (line_idx + 1) * sentences_per_line
+            end_idx = round(target_end)
+            # Ensure at least 1 sentence per line
+            end_idx = max(end_idx, start_idx + 1)
         
-        # Fill line until we reach target or run out of sentences
-        while sentence_idx < len(translated_sentences):
-            sentence = translated_sentences[sentence_idx]
-            sentence_len = len(sentence)
-            
-            # Add sentence if:
-            # 1. Line is empty (always add at least one sentence per line if available)
-            # 2. Adding it wouldn't exceed 150% of target
-            # 3. This is the last line (take everything remaining)
-            is_last_line = (line_idx == num_lines - 1)
-            
-            if not line_parts or current_chars + sentence_len <= target_chars * 1.5 or is_last_line:
-                line_parts.append(sentence)
-                current_chars += sentence_len
-                sentence_idx += 1
-                
-                if is_last_line:
-                    continue  # Take all remaining
-                if current_chars >= target_chars:
-                    break  # Line is full enough
-            else:
-                break  # Move to next line
-        
-        lines.append(' '.join(line_parts))
+        # Collect sentences for this line
+        line_sentences = translated_sentences[start_idx:end_idx]
+        lines.append(' '.join(line_sentences))
+        sentence_idx = end_idx
     
     # Ensure we have exactly num_lines
     while len(lines) < num_lines:
@@ -177,9 +168,13 @@ def _distribute_single_sentence(
     original_line_lengths: List[int]
 ) -> List[str]:
     """
-    Distribute a single sentence across multiple lines proportionally.
+    Distribute a single sentence across multiple lines.
     
-    Tries to break at word boundaries while respecting original line proportions.
+    Uses word-based distribution to avoid breaking words and ensure
+    each line has meaningful content.
+    
+    Strategy: distribute words evenly, with slight bias toward matching
+    original proportions, but ensuring minimum words per line.
     """
     words = sentence.split()
     if not words:
@@ -188,20 +183,35 @@ def _distribute_single_sentence(
     if num_lines == 1:
         return [sentence]
     
-    total_original = sum(original_line_lengths) or 1
+    # If very few words, just put them on the first lines
+    if len(words) <= num_lines:
+        result = []
+        for i in range(num_lines):
+            if i < len(words):
+                result.append(words[i])
+            else:
+                result.append('')
+        return result
+    
+    # Calculate target words per line (at least 1 word per line)
+    base_words_per_line = len(words) // num_lines
+    extra_words = len(words) % num_lines
+    
     lines = []
     word_idx = 0
     
     for line_idx in range(num_lines):
-        # Calculate proportion of words for this line
+        # Each line gets base words, plus 1 extra if we still have remainder
+        words_for_this_line = base_words_per_line
+        if line_idx < extra_words:
+            words_for_this_line += 1
+        
+        # Last line takes all remaining (safety)
         if line_idx == num_lines - 1:
-            # Last line takes all remaining
             line_words = words[word_idx:]
         else:
-            proportion = original_line_lengths[line_idx] / total_original
-            words_for_line = max(1, int(len(words) * proportion))
-            line_words = words[word_idx:word_idx + words_for_line]
-            word_idx += words_for_line
+            line_words = words[word_idx:word_idx + words_for_this_line]
+            word_idx += words_for_this_line
         
         lines.append(' '.join(line_words))
     
@@ -362,6 +372,57 @@ class TranslationEngine:
         text = text.replace('\u2009', ' ')  # Thin space
         
         return text
+    
+    def _protect_urls(self, text: str) -> tuple[str, dict]:
+        """
+        Extract and protect URLs from being translated.
+        
+        URLs confuse the translation model and can cause hallucinations.
+        We use XML-like tags that the model will preserve.
+        
+        Returns:
+            Tuple of (text with placeholders, dict mapping placeholder to URL)
+        """
+        import re
+        
+        # Pattern to match URLs
+        url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+        
+        placeholders = {}
+        counter = [0]  # Use list for closure modification
+        
+        def replace_url(match):
+            url = match.group(0)
+            # Use format that models typically preserve: quoted strings or brackets
+            placeholder = f'[URL{counter[0]}]'
+            placeholders[placeholder] = url
+            counter[0] += 1
+            return placeholder
+        
+        protected_text = re.sub(url_pattern, replace_url, text)
+        return protected_text, placeholders
+    
+    def _restore_urls(self, text: str, placeholders: dict) -> str:
+        """Restore URLs from placeholders after translation."""
+        import re
+        for placeholder, url in placeholders.items():
+            # Try exact match first
+            if placeholder in text:
+                text = text.replace(placeholder, url)
+            else:
+                # Try variations: [URL0], [ URL0 ], URL0, etc.
+                base = placeholder.strip('[]')
+                patterns = [
+                    re.escape(placeholder),
+                    r'\[\s*' + re.escape(base) + r'\s*\]',
+                    re.escape(base),
+                ]
+                for pattern in patterns:
+                    regex = re.compile(pattern, re.IGNORECASE)
+                    if regex.search(text):
+                        text = regex.sub(url, text)
+                        break
+        return text
 
     def translate(self, text: str, max_length: int = 512) -> str:
         """
@@ -376,6 +437,9 @@ class TranslationEngine:
         """
         if not text or len(text.strip()) < 2:
             return text
+        
+        # Protect URLs from being translated (they cause hallucinations)
+        text, url_placeholders = self._protect_urls(text)
         
         # Normalize text to avoid <unk> tokens that cause truncation
         text = self._normalize_for_translation(text)
@@ -407,6 +471,9 @@ class TranslationEngine:
                 translated_tokens,
                 skip_special_tokens=True
             )[0]
+            
+            # Restore protected URLs
+            translation = self._restore_urls(translation, url_placeholders)
             
             # Quality logging
             original_words = len(text.split())
