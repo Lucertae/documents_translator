@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-LAC Translate - PyInstaller Build Specification for Linux
+LAC Translate - PyInstaller Build Specification (Windows & Linux)
 """
 
 import sys
@@ -117,6 +117,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Icona per Windows (se esiste)
+import os
+icon_path = 'assets/icon.ico' if os.path.exists('assets/icon.ico') else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -127,12 +131,13 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # GUI application, no console
+    console=True,  # Abilitato per vedere errori di avvio - cambiare a False per release
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=icon_path,  # Icona Windows (.ico)
 )
 
 coll = COLLECT(
