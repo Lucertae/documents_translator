@@ -1324,32 +1324,40 @@ class PDFProcessor:
         ocr_language: str = "en"
     ) -> pymupdf.Document:
         """
-        Translate a scanned (image-based) page using Layout-Aware OCR.
+        Translate a scanned (image-based) page using CLEAN SLATE approach.
         
-        Strategy:
-        1. Use LayoutDetection to identify document regions (columns, titles, text blocks)
-        2. Run PaddleOCR on each region separately to preserve structure
-        3. Translate region by region, maintaining column order
-        4. Use redaction to cover original text
-        5. Insert translated text in correct positions
+        Strategy (CLEAN SLATE - no overlapping issues):
+        1. Create a NEW BLANK PAGE with same dimensions
+        2. Use LayoutDetection to identify columns and text regions  
+        3. Run PaddleOCR to extract all text with positions
+        4. Group text by COLUMN to respect layout
+        5. Translate each column separately
+        6. Insert translated text into column boundaries on blank page
+        
+        This approach avoids:
+        - Text overlapping (each column has its own space)
+        - Original text showing through (blank page)
+        - Redaction failures
         
         Args:
-            new_doc: Document to modify
-            page: Page to translate
+            new_doc: Document to modify (will be replaced with clean page)
+            page: Original page to translate
             page_num: Page number (for logging)
             translator: Translation engine
             text_color: Color for translated text
             ocr_language: Language code for OCR
             
         Returns:
-            Modified document with translated text
+            New document with translated content on clean page
         """
         if not OCR_AVAILABLE:
             logging.warning(f"Page {page_num + 1}: OCR not available, cannot translate scanned page")
             return new_doc
         
         try:
-            # Get page dimensions
+            # ============================================
+            # STEP 0: Get page dimensions
+            # ============================================
             page_rect = page.rect
             page_width = page_rect.width
             page_height = page_rect.height
@@ -1362,7 +1370,7 @@ class PDFProcessor:
             img_array = np.array(img)
             
             # ============================================
-            # STEP 0: Preprocess image (rotation, dewarping)
+            # STEP 1: Preprocess image (rotation, dewarping)
             # ============================================
             doc_preprocessor = self._get_doc_preprocessor()
             if doc_preprocessor and DOC_PREPROCESSOR_AVAILABLE:
@@ -1371,24 +1379,21 @@ class PDFProcessor:
                     preprocess_result = doc_preprocessor.predict(img_array)
                     if preprocess_result and len(preprocess_result) > 0:
                         result_data = preprocess_result[0]
-                        
-                        # Check if rotation was detected
                         angle = result_data.get('angle', 0)
                         if angle != 0:
                             logging.info(f"Page {page_num + 1}: Detected rotation of {angle}°, correcting...")
-                        
-                        # Use the preprocessed (corrected) image
                         if 'output_img' in result_data and result_data['output_img'] is not None:
                             img_array = result_data['output_img']
                             logging.info(f"Page {page_num + 1}: Image preprocessing applied")
                 except Exception as e:
-                    logging.warning(f"Page {page_num + 1}: DocPreprocessor failed: {e}, using original image")
+                    logging.warning(f"Page {page_num + 1}: DocPreprocessor failed: {e}")
             
             # ============================================
-            # STEP 1: Layout Detection (if available)
+            # STEP 2: Layout Detection - find columns
             # ============================================
-            layout_regions = []
             layout_engine = self._get_layout_engine()
+            has_two_columns = False
+            column_boundaries = {'left': (0, page_width), 'right': None}
             
             if layout_engine and LAYOUT_DETECTION_AVAILABLE:
                 logging.info(f"Page {page_num + 1}: Running LayoutDetection...")
@@ -1396,50 +1401,26 @@ class PDFProcessor:
                     layout_result = layout_engine.predict(img_array)
                     if layout_result and len(layout_result) > 0:
                         boxes = layout_result[0].get('boxes', [])
+                        text_boxes = [b for b in boxes if b.get('label') in ['text', 'title', 'content'] and b.get('score', 0) > 0.5]
                         
-                        # Filter and organize layout regions
-                        for box in boxes:
-                            label = box.get('label', '')
-                            score = box.get('score', 0)
-                            coord = box.get('coordinate', [])
+                        if text_boxes:
+                            # Find column boundaries
+                            mid_x = page_width / 2
+                            left_boxes = [b for b in text_boxes if b['coordinate'][2] / ocr_scale < mid_x + 30]
+                            right_boxes = [b for b in text_boxes if b['coordinate'][0] / ocr_scale > mid_x - 30]
                             
-                            if score > 0.5 and len(coord) == 4 and label in ['text', 'title', 'content']:
-                                # Convert to page coordinates
-                                layout_regions.append({
-                                    'label': label,
-                                    'bbox': pymupdf.Rect(
-                                        coord[0] / ocr_scale,
-                                        coord[1] / ocr_scale,
-                                        coord[2] / ocr_scale,
-                                        coord[3] / ocr_scale
-                                    ),
-                                    'score': score
-                                })
-                        
-                        logging.info(f"Page {page_num + 1}: Found {len(layout_regions)} layout regions")
+                            if left_boxes and right_boxes:
+                                has_two_columns = True
+                                # Calculate actual column boundaries
+                                left_x1 = max(b['coordinate'][2] / ocr_scale for b in left_boxes)
+                                right_x0 = min(b['coordinate'][0] / ocr_scale for b in right_boxes)
+                                column_boundaries = {
+                                    'left': (0, left_x1 + 10),
+                                    'right': (right_x0 - 10, page_width)
+                                }
+                                logging.info(f"Page {page_num + 1}: 2-column layout: left 0-{left_x1:.0f}, right {right_x0:.0f}-{page_width:.0f}")
                 except Exception as e:
                     logging.warning(f"Page {page_num + 1}: LayoutDetection failed: {e}")
-            
-            # ============================================
-            # STEP 2: Determine columns from layout
-            # ============================================
-            mid_x = page_width / 2
-            has_two_columns = False
-            
-            if layout_regions:
-                # Cluster regions into columns by X position
-                # Simple column detection: find if there's a gap in the middle
-                left_layout = [r for r in layout_regions if r['bbox'].x1 < mid_x + 50]
-                right_layout = [r for r in layout_regions if r['bbox'].x0 > mid_x - 50]
-                
-                # Check if we have a two-column layout
-                if left_layout and right_layout:
-                    has_two_columns = True
-                    logging.info(f"Page {page_num + 1}: Detected 2-column layout (L:{len(left_layout)}, R:{len(right_layout)})")
-                else:
-                    logging.info(f"Page {page_num + 1}: Single-column layout detected")
-            else:
-                logging.info(f"Page {page_num + 1}: No layout detection, using position-based column detection")
             
             # ============================================
             # STEP 3: Run OCR
@@ -1462,7 +1443,6 @@ class PDFProcessor:
                         img_low = Image.open(io.BytesIO(pix_low.tobytes("png")))
                         img_array = np.array(img_low)
                         ocr_scale = 1.5
-                    continue
             
             if not result or len(result) == 0:
                 logging.warning(f"Page {page_num + 1}: OCR returned no results")
@@ -1480,15 +1460,15 @@ class PDFProcessor:
             logging.info(f"Page {page_num + 1}: OCR found {len(texts)} text regions")
             
             # ============================================
-            # STEP 4: Build text regions with proper ordering
+            # STEP 4: Build text regions and assign columns
             # ============================================
             MIN_CONFIDENCE = 0.5
             text_regions = []
+            mid_x = page_width / 2
             
             for text, score, poly in zip(texts, scores, polys):
                 if score < MIN_CONFIDENCE or not text.strip():
                     continue
-                
                 try:
                     if hasattr(poly, 'tolist'):
                         poly = poly.tolist()
@@ -1499,11 +1479,9 @@ class PDFProcessor:
                     center_x = (min(xs) + max(xs)) / 2
                     center_y = (min(ys) + max(ys)) / 2
                     
-                    # Determine which column this belongs to
-                    column = 0  # Default: left/single
-                    if has_two_columns:
-                        if center_x > mid_x:
-                            column = 1  # Right column
+                    column = 0
+                    if has_two_columns and center_x > mid_x:
+                        column = 1
                     
                     text_regions.append({
                         'text': text.strip(),
@@ -1512,8 +1490,7 @@ class PDFProcessor:
                         'center_y': center_y,
                         'height': max(ys) - min(ys),
                         'x0': min(xs),
-                        'column': column,
-                        'score': score
+                        'column': column
                     })
                 except Exception:
                     continue
@@ -1525,21 +1502,18 @@ class PDFProcessor:
             # ============================================
             # STEP 5: Group into lines BY COLUMN
             # ============================================
-            # Separate by column first
-            columns = {}
+            columns_data = {}
             for region in text_regions:
                 col = region['column']
-                if col not in columns:
-                    columns[col] = []
-                columns[col].append(region)
+                if col not in columns_data:
+                    columns_data[col] = []
+                columns_data[col].append(region)
             
-            # Process each column separately
             all_lines = []
-            for col_idx in sorted(columns.keys()):
-                col_regions = columns[col_idx]
+            for col_idx in sorted(columns_data.keys()):
+                col_regions = columns_data[col_idx]
                 col_regions.sort(key=lambda r: (r['center_y'], r['x0']))
                 
-                # Group into lines within this column
                 lines = []
                 if col_regions:
                     current_line = [col_regions[0]]
@@ -1552,17 +1526,15 @@ class PDFProcessor:
                             lines.append((col_idx, current_line))
                             current_line = [region]
                             LINE_THRESHOLD = region['height'] * 0.6
-                    
                     lines.append((col_idx, current_line))
-                
                 all_lines.extend(lines)
             
-            logging.info(f"Page {page_num + 1}: Grouped into {len(all_lines)} lines across {len(columns)} column(s)")
+            logging.info(f"Page {page_num + 1}: {len(all_lines)} lines in {len(columns_data)} column(s)")
             
             # ============================================
-            # STEP 6: Translate each line
+            # STEP 6: Translate and prepare column content
             # ============================================
-            translations_to_insert = []
+            column_content = {0: [], 1: []}
             
             for col_idx, line_regions in all_lines:
                 line_regions.sort(key=lambda r: r['x0'])
@@ -1574,92 +1546,97 @@ class PDFProcessor:
                     max(r['bbox'].x1 for r in line_regions),
                     max(r['bbox'].y1 for r in line_regions)
                 )
-                
                 avg_height = sum(r['height'] for r in line_regions) / len(line_regions)
-                translated = translator.translate(line_text)
                 
+                translated = translator.translate(line_text)
                 if translated and translated.strip():
-                    translations_to_insert.append({
-                        'bbox': line_bbox,
-                        'original': line_text,
-                        'translated': translated.strip(),
+                    column_content[col_idx].append({
+                        'y': line_bbox.y0,
+                        'text': translated.strip(),
                         'height': avg_height,
-                        'column': col_idx,
-                        'regions': line_regions
+                        'original_bbox': line_bbox
                     })
             
-            if not translations_to_insert:
-                logging.warning(f"Page {page_num + 1}: No translations generated")
-                return new_doc
-            
-            logging.info(f"Page {page_num + 1}: Inserting {len(translations_to_insert)} translated lines...")
-            
             # ============================================
-            # STEP 7: Apply redactions
+            # STEP 7: CREATE CLEAN PAGE and insert text
             # ============================================
-            for item in translations_to_insert:
-                for region in item['regions']:
-                    redact_rect = pymupdf.Rect(
-                        region['bbox'].x0 - 2,
-                        region['bbox'].y0 - 2,
-                        region['bbox'].x1 + 2,
-                        region['bbox'].y1 + 2
-                    )
-                    page.add_redact_annot(redact_rect, fill=(1, 1, 1))
+            # Delete existing page content and create blank
+            new_page = new_doc[0]
             
-            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+            # Clear everything - draw white rectangle over entire page
+            new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
             
-            # ============================================
-            # STEP 8: Insert translated text
-            # ============================================
-            for item in translations_to_insert:
-                bbox = item['bbox']
-                translated = item['translated']
-                text_height = item['height']
+            # Calculate column text areas
+            margin_top = 30
+            margin_left = 30
+            margin_right = 30
+            line_spacing = 1.3
+            
+            if has_two_columns:
+                col0_x0 = margin_left
+                col0_x1 = column_boundaries['left'][1]
+                col1_x0 = column_boundaries['right'][0]
+                col1_x1 = page_width - margin_right
+            else:
+                col0_x0 = margin_left
+                col0_x1 = page_width - margin_right
+                col1_x0 = col1_x1 = 0
+            
+            # Insert translated text column by column
+            total_inserted = 0
+            
+            for col_idx in sorted(column_content.keys()):
+                content = column_content[col_idx]
+                if not content:
+                    continue
                 
-                font_size = max(7, min(text_height * 0.85, 24))
+                # Determine column boundaries
+                if col_idx == 0:
+                    col_x0, col_x1 = col0_x0, col0_x1
+                else:
+                    if not has_two_columns:
+                        continue
+                    col_x0, col_x1 = col1_x0, col1_x1
                 
-                try:
-                    text_rect = pymupdf.Rect(
-                        bbox.x0,
-                        bbox.y0,
-                        bbox.x1 + 30,
-                        bbox.y1 + text_height * 0.5
-                    )
+                col_width = col_x1 - col_x0
+                if col_width < 50:
+                    continue
+                
+                # Insert each line in column
+                for item in content:
+                    y_pos = item['y']
+                    text = item['text']
+                    height = item['height']
                     
-                    excess = page.insert_textbox(
-                        text_rect,
-                        translated,
-                        fontsize=font_size,
-                        fontname="helv",
-                        color=text_color,
-                        align=0
-                    )
+                    font_size = max(7, min(height * 0.85, 14))
                     
-                    if excess < 0:
-                        smaller_size = max(6, font_size * 0.75)
-                        page.insert_textbox(
+                    try:
+                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + height * line_spacing)
+                        
+                        excess = new_page.insert_textbox(
                             text_rect,
-                            translated,
-                            fontsize=smaller_size,
+                            text,
+                            fontsize=font_size,
                             fontname="helv",
                             color=text_color,
                             align=0
                         )
-                except Exception as e:
-                    try:
-                        insert_point = pymupdf.Point(bbox.x0, bbox.y0 + font_size)
-                        page.insert_text(
-                            insert_point,
-                            translated,
-                            fontsize=font_size,
-                            fontname="helv",
-                            color=text_color
-                        )
-                    except Exception as e2:
-                        logging.debug(f"Failed to insert text: {e2}")
+                        
+                        if excess < 0:
+                            # Text didn't fit, try smaller font
+                            new_page.insert_textbox(
+                                text_rect,
+                                text,
+                                fontsize=max(6, font_size * 0.8),
+                                fontname="helv",
+                                color=text_color,
+                                align=0
+                            )
+                        total_inserted += 1
+                    except Exception as e:
+                        logging.debug(f"Failed to insert line: {e}")
             
-            logging.info(f"Page {page_num + 1}: Successfully translated scanned page ({len(translations_to_insert)} lines)")
+            logging.info(f"Page {page_num + 1}: Clean page created with {total_inserted} translated lines")
             return new_doc
             
         except Exception as e:
