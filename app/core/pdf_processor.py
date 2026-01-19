@@ -626,12 +626,36 @@ def detect_title_or_heading(line_info: LineFormatInfo, all_lines: List[LineForma
     
     return indicators >= 3
 
+# OCR and Document Analysis imports
 try:
-    from paddleocr import PaddleOCR
+    from paddleocr import PaddleOCR, LayoutDetection
     OCR_AVAILABLE = True
+    LAYOUT_DETECTION_AVAILABLE = True
 except ImportError:
-    OCR_AVAILABLE = False
-    logging.warning("OCR not available - install paddleocr for scanned PDF support")
+    try:
+        from paddleocr import PaddleOCR
+        OCR_AVAILABLE = True
+        LAYOUT_DETECTION_AVAILABLE = False
+    except ImportError:
+        OCR_AVAILABLE = False
+        LAYOUT_DETECTION_AVAILABLE = False
+        logging.warning("OCR not available - install paddleocr for scanned PDF support")
+
+# DocPreprocessor for automatic image correction (rotation, dewarping)
+try:
+    from paddleocr import DocPreprocessor
+    DOC_PREPROCESSOR_AVAILABLE = True
+except ImportError:
+    DOC_PREPROCESSOR_AVAILABLE = False
+    logging.debug("DocPreprocessor not available - install paddleocr[doc-parser] for better preprocessing")
+
+# PPStructureV3 for advanced document structure analysis
+try:
+    from paddleocr import PPStructureV3
+    PP_STRUCTURE_AVAILABLE = True
+except ImportError:
+    PP_STRUCTURE_AVAILABLE = False
+    logging.debug("PPStructureV3 not available - install paddleocr[doc-parser] for advanced structure analysis")
 
 
 class PDFProcessor:
@@ -660,6 +684,15 @@ class PDFProcessor:
     # Singleton PaddleOCR instance (lazy loading)
     _ocr_engine = None
     _current_lang = None
+    
+    # Singleton LayoutDetection instance
+    _layout_engine = None
+    
+    # Singleton DocPreprocessor instance
+    _doc_preprocessor = None
+    
+    # Singleton PPStructureV3 instance
+    _pp_structure = None
     
     def __init__(self, pdf_path: str):
         """
@@ -965,6 +998,51 @@ class PDFProcessor:
                 cls._ocr_engine = None
         return cls._ocr_engine
     
+    @classmethod
+    def _get_layout_engine(cls):
+        """Get or create LayoutDetection engine (singleton)."""
+        if not LAYOUT_DETECTION_AVAILABLE:
+            return None
+        if cls._layout_engine is None:
+            logging.info("Initializing LayoutDetection engine...")
+            try:
+                cls._layout_engine = LayoutDetection()
+                logging.info("✓ LayoutDetection initialized")
+            except Exception as e:
+                logging.error(f"Failed to initialize LayoutDetection: {e}")
+                cls._layout_engine = None
+        return cls._layout_engine
+    
+    @classmethod
+    def _get_doc_preprocessor(cls):
+        """Get or create DocPreprocessor engine (singleton) for automatic image correction."""
+        if not DOC_PREPROCESSOR_AVAILABLE:
+            return None
+        if cls._doc_preprocessor is None:
+            logging.info("Initializing DocPreprocessor engine...")
+            try:
+                cls._doc_preprocessor = DocPreprocessor()
+                logging.info("✓ DocPreprocessor initialized")
+            except Exception as e:
+                logging.error(f"Failed to initialize DocPreprocessor: {e}")
+                cls._doc_preprocessor = None
+        return cls._doc_preprocessor
+    
+    @classmethod
+    def _get_pp_structure(cls):
+        """Get or create PPStructureV3 engine (singleton) for advanced document parsing."""
+        if not PP_STRUCTURE_AVAILABLE:
+            return None
+        if cls._pp_structure is None:
+            logging.info("Initializing PPStructureV3 engine...")
+            try:
+                cls._pp_structure = PPStructureV3()
+                logging.info("✓ PPStructureV3 initialized")
+            except Exception as e:
+                logging.error(f"Failed to initialize PPStructureV3: {e}")
+                cls._pp_structure = None
+        return cls._pp_structure
+    
     def _extract_via_ocr(self, page: pymupdf.Page, language: str) -> str:
         """
         Extract text using PaddleOCR v3+ with intelligent segmentation.
@@ -1236,6 +1314,358 @@ class PDFProcessor:
         img_bytes = pix.tobytes("png")
         return img_bytes, pix.width, pix.height
     
+    def _translate_scanned_page(
+        self,
+        new_doc: pymupdf.Document,
+        page: pymupdf.Page,
+        page_num: int,
+        translator,
+        text_color: Tuple[float, float, float] = (0, 0, 0),
+        ocr_language: str = "en"
+    ) -> pymupdf.Document:
+        """
+        Translate a scanned (image-based) page using Layout-Aware OCR.
+        
+        Strategy:
+        1. Use LayoutDetection to identify document regions (columns, titles, text blocks)
+        2. Run PaddleOCR on each region separately to preserve structure
+        3. Translate region by region, maintaining column order
+        4. Use redaction to cover original text
+        5. Insert translated text in correct positions
+        
+        Args:
+            new_doc: Document to modify
+            page: Page to translate
+            page_num: Page number (for logging)
+            translator: Translation engine
+            text_color: Color for translated text
+            ocr_language: Language code for OCR
+            
+        Returns:
+            Modified document with translated text
+        """
+        if not OCR_AVAILABLE:
+            logging.warning(f"Page {page_num + 1}: OCR not available, cannot translate scanned page")
+            return new_doc
+        
+        try:
+            # Get page dimensions
+            page_rect = page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            
+            # Convert page to image for OCR
+            ocr_scale = 2.0
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(ocr_scale, ocr_scale))
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            img_array = np.array(img)
+            
+            # ============================================
+            # STEP 0: Preprocess image (rotation, dewarping)
+            # ============================================
+            doc_preprocessor = self._get_doc_preprocessor()
+            if doc_preprocessor and DOC_PREPROCESSOR_AVAILABLE:
+                logging.info(f"Page {page_num + 1}: Running DocPreprocessor...")
+                try:
+                    preprocess_result = doc_preprocessor.predict(img_array)
+                    if preprocess_result and len(preprocess_result) > 0:
+                        result_data = preprocess_result[0]
+                        
+                        # Check if rotation was detected
+                        angle = result_data.get('angle', 0)
+                        if angle != 0:
+                            logging.info(f"Page {page_num + 1}: Detected rotation of {angle}°, correcting...")
+                        
+                        # Use the preprocessed (corrected) image
+                        if 'output_img' in result_data and result_data['output_img'] is not None:
+                            img_array = result_data['output_img']
+                            logging.info(f"Page {page_num + 1}: Image preprocessing applied")
+                except Exception as e:
+                    logging.warning(f"Page {page_num + 1}: DocPreprocessor failed: {e}, using original image")
+            
+            # ============================================
+            # STEP 1: Layout Detection (if available)
+            # ============================================
+            layout_regions = []
+            layout_engine = self._get_layout_engine()
+            
+            if layout_engine and LAYOUT_DETECTION_AVAILABLE:
+                logging.info(f"Page {page_num + 1}: Running LayoutDetection...")
+                try:
+                    layout_result = layout_engine.predict(img_array)
+                    if layout_result and len(layout_result) > 0:
+                        boxes = layout_result[0].get('boxes', [])
+                        
+                        # Filter and organize layout regions
+                        for box in boxes:
+                            label = box.get('label', '')
+                            score = box.get('score', 0)
+                            coord = box.get('coordinate', [])
+                            
+                            if score > 0.5 and len(coord) == 4 and label in ['text', 'title', 'content']:
+                                # Convert to page coordinates
+                                layout_regions.append({
+                                    'label': label,
+                                    'bbox': pymupdf.Rect(
+                                        coord[0] / ocr_scale,
+                                        coord[1] / ocr_scale,
+                                        coord[2] / ocr_scale,
+                                        coord[3] / ocr_scale
+                                    ),
+                                    'score': score
+                                })
+                        
+                        logging.info(f"Page {page_num + 1}: Found {len(layout_regions)} layout regions")
+                except Exception as e:
+                    logging.warning(f"Page {page_num + 1}: LayoutDetection failed: {e}")
+            
+            # ============================================
+            # STEP 2: Determine columns from layout
+            # ============================================
+            mid_x = page_width / 2
+            has_two_columns = False
+            
+            if layout_regions:
+                # Cluster regions into columns by X position
+                # Simple column detection: find if there's a gap in the middle
+                left_layout = [r for r in layout_regions if r['bbox'].x1 < mid_x + 50]
+                right_layout = [r for r in layout_regions if r['bbox'].x0 > mid_x - 50]
+                
+                # Check if we have a two-column layout
+                if left_layout and right_layout:
+                    has_two_columns = True
+                    logging.info(f"Page {page_num + 1}: Detected 2-column layout (L:{len(left_layout)}, R:{len(right_layout)})")
+                else:
+                    logging.info(f"Page {page_num + 1}: Single-column layout detected")
+            else:
+                logging.info(f"Page {page_num + 1}: No layout detection, using position-based column detection")
+            
+            # ============================================
+            # STEP 3: Run OCR
+            # ============================================
+            ocr = self._get_ocr_engine(ocr_language)
+            if ocr is None:
+                logging.error(f"Page {page_num + 1}: Failed to get OCR engine")
+                return new_doc
+            
+            logging.info(f"Page {page_num + 1}: Running PaddleOCR...")
+            result = None
+            for attempt in range(2):
+                try:
+                    result = ocr.predict(img_array)
+                    break
+                except RuntimeError as e:
+                    logging.warning(f"Page {page_num + 1}: OCR attempt {attempt + 1} failed: {e}")
+                    if attempt == 0:
+                        pix_low = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
+                        img_low = Image.open(io.BytesIO(pix_low.tobytes("png")))
+                        img_array = np.array(img_low)
+                        ocr_scale = 1.5
+                    continue
+            
+            if not result or len(result) == 0:
+                logging.warning(f"Page {page_num + 1}: OCR returned no results")
+                return new_doc
+            
+            ocr_result = result[0]
+            texts = ocr_result.get('rec_texts', [])
+            scores = ocr_result.get('rec_scores', [])
+            polys = ocr_result.get('rec_polys', [])
+            
+            if not texts:
+                logging.warning(f"Page {page_num + 1}: No text found by OCR")
+                return new_doc
+            
+            logging.info(f"Page {page_num + 1}: OCR found {len(texts)} text regions")
+            
+            # ============================================
+            # STEP 4: Build text regions with proper ordering
+            # ============================================
+            MIN_CONFIDENCE = 0.5
+            text_regions = []
+            
+            for text, score, poly in zip(texts, scores, polys):
+                if score < MIN_CONFIDENCE or not text.strip():
+                    continue
+                
+                try:
+                    if hasattr(poly, 'tolist'):
+                        poly = poly.tolist()
+                    xs = [p[0] / ocr_scale for p in poly]
+                    ys = [p[1] / ocr_scale for p in poly]
+                    
+                    bbox = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
+                    center_x = (min(xs) + max(xs)) / 2
+                    center_y = (min(ys) + max(ys)) / 2
+                    
+                    # Determine which column this belongs to
+                    column = 0  # Default: left/single
+                    if has_two_columns:
+                        if center_x > mid_x:
+                            column = 1  # Right column
+                    
+                    text_regions.append({
+                        'text': text.strip(),
+                        'bbox': bbox,
+                        'center_x': center_x,
+                        'center_y': center_y,
+                        'height': max(ys) - min(ys),
+                        'x0': min(xs),
+                        'column': column,
+                        'score': score
+                    })
+                except Exception:
+                    continue
+            
+            if not text_regions:
+                logging.warning(f"Page {page_num + 1}: No valid text regions")
+                return new_doc
+            
+            # ============================================
+            # STEP 5: Group into lines BY COLUMN
+            # ============================================
+            # Separate by column first
+            columns = {}
+            for region in text_regions:
+                col = region['column']
+                if col not in columns:
+                    columns[col] = []
+                columns[col].append(region)
+            
+            # Process each column separately
+            all_lines = []
+            for col_idx in sorted(columns.keys()):
+                col_regions = columns[col_idx]
+                col_regions.sort(key=lambda r: (r['center_y'], r['x0']))
+                
+                # Group into lines within this column
+                lines = []
+                if col_regions:
+                    current_line = [col_regions[0]]
+                    LINE_THRESHOLD = col_regions[0]['height'] * 0.6
+                    
+                    for region in col_regions[1:]:
+                        if abs(region['center_y'] - current_line[0]['center_y']) < LINE_THRESHOLD:
+                            current_line.append(region)
+                        else:
+                            lines.append((col_idx, current_line))
+                            current_line = [region]
+                            LINE_THRESHOLD = region['height'] * 0.6
+                    
+                    lines.append((col_idx, current_line))
+                
+                all_lines.extend(lines)
+            
+            logging.info(f"Page {page_num + 1}: Grouped into {len(all_lines)} lines across {len(columns)} column(s)")
+            
+            # ============================================
+            # STEP 6: Translate each line
+            # ============================================
+            translations_to_insert = []
+            
+            for col_idx, line_regions in all_lines:
+                line_regions.sort(key=lambda r: r['x0'])
+                line_text = ' '.join(r['text'] for r in line_regions)
+                
+                line_bbox = pymupdf.Rect(
+                    min(r['bbox'].x0 for r in line_regions),
+                    min(r['bbox'].y0 for r in line_regions),
+                    max(r['bbox'].x1 for r in line_regions),
+                    max(r['bbox'].y1 for r in line_regions)
+                )
+                
+                avg_height = sum(r['height'] for r in line_regions) / len(line_regions)
+                translated = translator.translate(line_text)
+                
+                if translated and translated.strip():
+                    translations_to_insert.append({
+                        'bbox': line_bbox,
+                        'original': line_text,
+                        'translated': translated.strip(),
+                        'height': avg_height,
+                        'column': col_idx,
+                        'regions': line_regions
+                    })
+            
+            if not translations_to_insert:
+                logging.warning(f"Page {page_num + 1}: No translations generated")
+                return new_doc
+            
+            logging.info(f"Page {page_num + 1}: Inserting {len(translations_to_insert)} translated lines...")
+            
+            # ============================================
+            # STEP 7: Apply redactions
+            # ============================================
+            for item in translations_to_insert:
+                for region in item['regions']:
+                    redact_rect = pymupdf.Rect(
+                        region['bbox'].x0 - 2,
+                        region['bbox'].y0 - 2,
+                        region['bbox'].x1 + 2,
+                        region['bbox'].y1 + 2
+                    )
+                    page.add_redact_annot(redact_rect, fill=(1, 1, 1))
+            
+            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+            
+            # ============================================
+            # STEP 8: Insert translated text
+            # ============================================
+            for item in translations_to_insert:
+                bbox = item['bbox']
+                translated = item['translated']
+                text_height = item['height']
+                
+                font_size = max(7, min(text_height * 0.85, 24))
+                
+                try:
+                    text_rect = pymupdf.Rect(
+                        bbox.x0,
+                        bbox.y0,
+                        bbox.x1 + 30,
+                        bbox.y1 + text_height * 0.5
+                    )
+                    
+                    excess = page.insert_textbox(
+                        text_rect,
+                        translated,
+                        fontsize=font_size,
+                        fontname="helv",
+                        color=text_color,
+                        align=0
+                    )
+                    
+                    if excess < 0:
+                        smaller_size = max(6, font_size * 0.75)
+                        page.insert_textbox(
+                            text_rect,
+                            translated,
+                            fontsize=smaller_size,
+                            fontname="helv",
+                            color=text_color,
+                            align=0
+                        )
+                except Exception as e:
+                    try:
+                        insert_point = pymupdf.Point(bbox.x0, bbox.y0 + font_size)
+                        page.insert_text(
+                            insert_point,
+                            translated,
+                            fontsize=font_size,
+                            fontname="helv",
+                            color=text_color
+                        )
+                    except Exception as e2:
+                        logging.debug(f"Failed to insert text: {e2}")
+            
+            logging.info(f"Page {page_num + 1}: Successfully translated scanned page ({len(translations_to_insert)} lines)")
+            return new_doc
+            
+        except Exception as e:
+            logging.error(f"Page {page_num + 1}: OCR translation failed: {e}", exc_info=True)
+            return new_doc
+
     def translate_page(
         self, 
         page_num: int, 
@@ -1243,17 +1673,23 @@ class PDFProcessor:
         text_color: Tuple[float, float, float] = (0, 0, 0),
         use_original_color: bool = True,
         preserve_font_style: bool = True,
-        preserve_line_breaks: bool = True
+        preserve_line_breaks: bool = True,
+        ocr_language: str = "en"
     ) -> pymupdf.Document:
         """
         World-class translation system with maximum fidelity to original.
         
         Architecture:
-        1. Phase 1: Extract all text structure with SPAN-LEVEL formatting
-        2. Phase 2: Translate LINE BY LINE to preserve structure
-        3. Phase 3: Apply SPAN-LEVEL formatting to translated text
-        4. Phase 4: Remove ALL original text via redaction (clean slate)
-        5. Phase 5: Insert translations with inline formatting preserved
+        1. Phase 0: Detect if page is scanned and needs OCR
+        2. Phase 1: Extract all text structure with SPAN-LEVEL formatting
+        3. Phase 2: Translate LINE BY LINE to preserve structure
+        4. Phase 3: Apply SPAN-LEVEL formatting to translated text
+        5. Phase 4: Remove ALL original text via redaction (clean slate)
+        6. Phase 5: Insert translations with inline formatting preserved
+        
+        For scanned pages:
+        - Uses PaddleOCR to extract text with bounding boxes
+        - Overlays translated text on top of the scanned image
         
         LINE-BY-LINE TRANSLATION (preserve_line_breaks=True):
         This mode translates each line independently, preserving the original
@@ -1278,6 +1714,7 @@ class PDFProcessor:
             use_original_color: If True, use the original text color instead (default True)
             preserve_font_style: If True, match original font family style
             preserve_line_breaks: If True, translate line by line (default True)
+            ocr_language: Language code for OCR (default "en")
             
         Returns:
             New document containing translated page
@@ -1287,6 +1724,18 @@ class PDFProcessor:
         new_doc = pymupdf.open()
         new_doc.insert_pdf(self.document, from_page=page_num, to_page=page_num)
         page = new_doc[0]
+        
+        # ============================================
+        # PHASE 0: Check if page is scanned (needs OCR)
+        # ============================================
+        is_scanned, scan_reason = self._is_likely_scanned_page(page)
+        
+        if is_scanned:
+            logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason}), using OCR translation mode")
+            return self._translate_scanned_page(
+                new_doc, page, page_num, translator, 
+                text_color, ocr_language
+            )
         
         text_dict = page.get_text("dict")
         
