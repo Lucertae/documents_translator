@@ -44,6 +44,76 @@ class TranslationWorker(QThread):
             self.error.emit(str(e))
 
 
+class BatchTranslationWorker(QThread):
+    """Background worker for batch translation of all pages."""
+    
+    # Signal: current_page, total_pages
+    progress = Signal(int, int)
+    # Signal: page_num, pdf_bytes (serialized document)
+    page_finished = Signal(int, bytes)
+    # Signal: total pages count
+    all_finished = Signal(int)
+    # Signal: error message
+    error = Signal(str)
+    
+    def __init__(self, pdf_processor, translator, already_translated_pages: set = None, use_original_color=True):
+        super().__init__()
+        self.pdf_processor = pdf_processor
+        self.translator = translator
+        # Store just the page numbers that are already translated
+        self.already_translated_pages = already_translated_pages or set()
+        self.use_original_color = use_original_color
+        self._cancelled = False
+        self.pages_translated = 0
+    
+    def cancel(self):
+        """Request cancellation of batch translation."""
+        self._cancelled = True
+    
+    def run(self):
+        try:
+            total_pages = self.pdf_processor.page_count
+            self.pages_translated = 0
+            
+            for page_num in range(total_pages):
+                # Check for cancellation
+                if self._cancelled:
+                    logging.info("Batch translation cancelled by user")
+                    break
+                
+                # Skip already translated pages
+                if page_num in self.already_translated_pages:
+                    self.progress.emit(page_num + 1, total_pages)
+                    continue
+                
+                # Emit progress before starting
+                self.progress.emit(page_num + 1, total_pages)
+                
+                # Translate the page
+                translated_doc = self.pdf_processor.translate_page(
+                    page_num,
+                    self.translator,
+                    use_original_color=self.use_original_color
+                )
+                
+                # Serialize document to bytes for thread-safe transfer
+                if translated_doc:
+                    pdf_bytes = translated_doc.tobytes()
+                    self.page_finished.emit(page_num, pdf_bytes)
+                    self.pages_translated += 1
+                    logging.info(f"Worker: Page {page_num + 1} translated ({self.pages_translated} total)")
+                else:
+                    logging.warning(f"Worker: Page {page_num + 1} returned None")
+            
+            # Emit all finished with count
+            if not self._cancelled:
+                self.all_finished.emit(self.pages_translated)
+                
+        except Exception as e:
+            self.error.emit(str(e))
+            logging.error(f"Batch translation error: {e}", exc_info=True)
+
+
 class GlowButton(QPushButton):
     """Premium button with animated glow effect."""
     
@@ -144,6 +214,7 @@ class MainWindow(QMainWindow):
         self.current_page = 0
         self.translated_pages = {}
         self.translation_worker = None
+        self.batch_translation_worker = None
         
         self._init_ui()
         self._create_actions()
@@ -1057,12 +1128,183 @@ class MainWindow(QMainWindow):
     
     @Slot()
     def translate_all_pages(self):
-        """Translate all pages."""
+        """Translate all pages in batch mode."""
+        if not self.pdf_processor or not self.translator:
+            QMessageBox.warning(
+                self,
+                "No Document",
+                "Please open a PDF document first."
+            )
+            return
+        
+        # Check if batch translation is already running
+        if self.batch_translation_worker and self.batch_translation_worker.isRunning():
+            # Ask user if they want to cancel
+            result = QMessageBox.question(
+                self,
+                "Translation In Progress",
+                "Batch translation is already running.\nDo you want to cancel it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if result == QMessageBox.Yes:
+                self.batch_translation_worker.cancel()
+                self.on_batch_cancelled()
+            return
+        
+        # Check how many pages need translation
+        total_pages = self.pdf_processor.page_count
+        already_translated = len(self.translated_pages)
+        remaining = total_pages - already_translated
+        
+        if remaining == 0:
+            QMessageBox.information(
+                self,
+                "Already Complete",
+                f"All {total_pages} pages have already been translated."
+            )
+            return
+        
+        # Confirm with user
+        if remaining > 1:
+            result = QMessageBox.question(
+                self,
+                "Translate All Pages",
+                f"Translate {remaining} pages?\n"
+                f"({already_translated} of {total_pages} already translated)\n\n"
+                f"This may take several minutes.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if result != QMessageBox.Yes:
+                return
+        
+        # Show progress
+        self.progress_container.setVisible(True)
+        self.progress_bar.setRange(0, total_pages)
+        self.progress_bar.setValue(already_translated)
+        self.progress_label.setText(f"Translating page 1 of {total_pages}...")
+        
+        # Disable buttons during translation
+        self.btn_translate.setEnabled(False)
+        self.btn_translate_all.setEnabled(False)
+        self.btn_translate_all.setText("Cancel Translation")
+        self.btn_translate_all.setEnabled(True)
+        
+        # Start batch translation worker
+        self.batch_translation_worker = BatchTranslationWorker(
+            self.pdf_processor,
+            self.translator,
+            already_translated_pages=set(self.translated_pages.keys())
+        )
+        # Use Qt.QueuedConnection for cross-thread signal handling
+        self.batch_translation_worker.progress.connect(
+            self.on_batch_progress, Qt.QueuedConnection
+        )
+        self.batch_translation_worker.page_finished.connect(
+            self.on_batch_page_finished, Qt.QueuedConnection
+        )
+        self.batch_translation_worker.all_finished.connect(
+            self.on_batch_all_finished, Qt.QueuedConnection
+        )
+        self.batch_translation_worker.error.connect(
+            self.on_batch_error, Qt.QueuedConnection
+        )
+        self.batch_translation_worker.start()
+        
+        self.status_bar.showMessage("Batch translation started...")
+        logging.info(f"Started batch translation of {total_pages} pages")
+    
+    @Slot(int, int)
+    def on_batch_progress(self, current_page: int, total_pages: int):
+        """Handle batch translation progress update."""
+        self.progress_bar.setValue(current_page)
+        self.progress_label.setText(f"Translating page {current_page} of {total_pages}...")
+        self.status_bar.showMessage(f"Translating page {current_page}/{total_pages}")
+    
+    @Slot(int, bytes)
+    def on_batch_page_finished(self, page_num: int, pdf_bytes: bytes):
+        """Handle completion of a single page during batch translation."""
+        if pdf_bytes:
+            try:
+                # Deserialize PDF bytes back to document
+                import pymupdf
+                translated_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                self.translated_pages[page_num] = translated_doc
+                logging.info(f"Batch: Page {page_num + 1} translated and stored (total: {len(self.translated_pages)})")
+                
+                # Update viewer if this is the current page
+                if page_num == self.current_page:
+                    self.display_translated_page(page_num)
+                    self.translated_panel.set_active(True)
+            except Exception as e:
+                logging.error(f"Failed to deserialize page {page_num + 1}: {e}")
+        else:
+            logging.warning(f"Batch: Page {page_num + 1} returned empty bytes!")
+    
+    @Slot(int)
+    def on_batch_all_finished(self, pages_count: int):
+        """Handle completion of entire batch translation."""
+        # Note: self.translated_pages is already updated incrementally via on_batch_page_finished
+        
+        # Reset UI
+        self.progress_container.setVisible(False)
+        self.btn_translate.setEnabled(True)
+        self.btn_translate_all.setText("Translate All Pages")
+        self.btn_translate_all.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        
+        # Update display
+        self.update_page_display()
+        
+        total_pages = len(self.translated_pages)
+        self.status_bar.showMessage(f"All {total_pages} pages translated successfully!", 10000)
+        
         QMessageBox.information(
             self,
-            "Coming Soon",
-            "Batch translation will be available in the next update."
+            "Translation Complete",
+            f"Successfully translated all {total_pages} pages.\n\n"
+            f"You can now save the translated PDF."
         )
+        
+        logging.info(f"Batch translation completed: {total_pages} pages")
+    
+    @Slot(str)
+    def on_batch_error(self, error_msg: str):
+        """Handle batch translation error."""
+        self.progress_container.setVisible(False)
+        self.btn_translate.setEnabled(True)
+        self.btn_translate_all.setText("Translate All Pages")
+        self.btn_translate_all.setEnabled(True)
+        
+        self.status_bar.showMessage("Batch translation failed")
+        
+        QMessageBox.critical(
+            self,
+            "Translation Error",
+            f"Batch translation failed:\n{error_msg}"
+        )
+        logging.error(f"Batch translation error: {error_msg}")
+    
+    def on_batch_cancelled(self):
+        """Handle batch translation cancellation."""
+        self.progress_container.setVisible(False)
+        self.btn_translate.setEnabled(True)
+        self.btn_translate_all.setText("Translate All Pages")
+        self.btn_translate_all.setEnabled(True)
+        
+        translated_count = len(self.translated_pages)
+        total_pages = self.pdf_processor.page_count if self.pdf_processor else 0
+        
+        self.status_bar.showMessage(
+            f"Translation cancelled ({translated_count}/{total_pages} pages completed)", 
+            5000
+        )
+        
+        if translated_count > 0:
+            self.btn_save.setEnabled(True)
+        
+        logging.info(f"Batch translation cancelled after {translated_count} pages")
     
     @Slot()
     def save_pdf(self):
