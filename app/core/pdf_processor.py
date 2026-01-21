@@ -1368,9 +1368,76 @@ class PDFProcessor:
             img_data = pix.tobytes("png")
             img = Image.open(io.BytesIO(img_data))
             img_array = np.array(img)
+            img_array_original = img_array.copy()  # Keep original for layout detection
             
             # ============================================
-            # STEP 1: Preprocess image (rotation, dewarping)
+            # STEP 1: Layout Detection - AUTOMATIC column detection
+            # Run on ORIGINAL image to get accurate column coordinates
+            # ============================================
+            layout_engine = self._get_layout_engine()
+            num_columns = 1
+            column_boundaries = [(0, page_width)]  # List of (x0, x1) tuples
+            
+            if layout_engine and LAYOUT_DETECTION_AVAILABLE:
+                logging.info(f"Page {page_num + 1}: Running LayoutDetection...")
+                try:
+                    layout_result = layout_engine.predict(img_array_original)
+                    if layout_result and len(layout_result) > 0:
+                        boxes = layout_result[0].get('boxes', [])
+                        text_boxes = [b for b in boxes if b.get('label') in ['text', 'title', 'content'] and b.get('score', 0) > 0.5]
+                        
+                        if text_boxes:
+                            # Auto-detect columns by clustering X centers
+                            x_centers = []
+                            for box in text_boxes:
+                                coord = box['coordinate']
+                                x0 = coord[0] / ocr_scale
+                                x1 = coord[2] / ocr_scale
+                                x_centers.append({
+                                    'center': (x0 + x1) / 2,
+                                    'x0': x0,
+                                    'x1': x1
+                                })
+                            
+                            # Sort by center X
+                            x_centers.sort(key=lambda c: c['center'])
+                            
+                            # Find gaps to identify column boundaries
+                            # Gap = significant horizontal space between regions
+                            # Use adaptive gap: smaller of 3% page width or 30pts
+                            MIN_GAP = min(page_width * 0.03, 30)
+                            column_clusters = []
+                            current_cluster = [x_centers[0]]
+                            
+                            for i in range(1, len(x_centers)):
+                                prev_right = max(c['x1'] for c in current_cluster)
+                                curr_left = x_centers[i]['x0']
+                                gap = curr_left - prev_right
+                                
+                                if gap > MIN_GAP:
+                                    # New column detected
+                                    column_clusters.append(current_cluster)
+                                    current_cluster = [x_centers[i]]
+                                else:
+                                    current_cluster.append(x_centers[i])
+                            
+                            column_clusters.append(current_cluster)
+                            num_columns = len(column_clusters)
+                            
+                            # Calculate boundaries for each column
+                            column_boundaries = []
+                            for cluster in column_clusters:
+                                col_x0 = min(c['x0'] for c in cluster) - 5
+                                col_x1 = max(c['x1'] for c in cluster) + 5
+                                column_boundaries.append((max(0, col_x0), min(page_width, col_x1)))
+                            
+                            logging.info(f"Page {page_num + 1}: Auto-detected {num_columns} columns: {[(int(b[0]), int(b[1])) for b in column_boundaries]}")
+                except Exception as e:
+                    logging.warning(f"Page {page_num + 1}: LayoutDetection failed: {e}")
+            
+            # ============================================
+            # STEP 2: Preprocess image (rotation, dewarping) - for OCR only
+            # Note: We use original coordinates for layout, but preprocessed image for better OCR
             # ============================================
             doc_preprocessor = self._get_doc_preprocessor()
             if doc_preprocessor and DOC_PREPROCESSOR_AVAILABLE:
@@ -1383,44 +1450,15 @@ class PDFProcessor:
                         if angle != 0:
                             logging.info(f"Page {page_num + 1}: Detected rotation of {angle}°, correcting...")
                         if 'output_img' in result_data and result_data['output_img'] is not None:
-                            img_array = result_data['output_img']
-                            logging.info(f"Page {page_num + 1}: Image preprocessing applied")
+                            # Only use preprocessed image if dimensions match (no rotation)
+                            preprocessed = result_data['output_img']
+                            if preprocessed.shape == img_array.shape:
+                                img_array = preprocessed
+                                logging.info(f"Page {page_num + 1}: Image preprocessing applied")
+                            else:
+                                logging.warning(f"Page {page_num + 1}: Skipping preprocessing (shape mismatch)")
                 except Exception as e:
                     logging.warning(f"Page {page_num + 1}: DocPreprocessor failed: {e}")
-            
-            # ============================================
-            # STEP 2: Layout Detection - find columns
-            # ============================================
-            layout_engine = self._get_layout_engine()
-            has_two_columns = False
-            column_boundaries = {'left': (0, page_width), 'right': None}
-            
-            if layout_engine and LAYOUT_DETECTION_AVAILABLE:
-                logging.info(f"Page {page_num + 1}: Running LayoutDetection...")
-                try:
-                    layout_result = layout_engine.predict(img_array)
-                    if layout_result and len(layout_result) > 0:
-                        boxes = layout_result[0].get('boxes', [])
-                        text_boxes = [b for b in boxes if b.get('label') in ['text', 'title', 'content'] and b.get('score', 0) > 0.5]
-                        
-                        if text_boxes:
-                            # Find column boundaries
-                            mid_x = page_width / 2
-                            left_boxes = [b for b in text_boxes if b['coordinate'][2] / ocr_scale < mid_x + 30]
-                            right_boxes = [b for b in text_boxes if b['coordinate'][0] / ocr_scale > mid_x - 30]
-                            
-                            if left_boxes and right_boxes:
-                                has_two_columns = True
-                                # Calculate actual column boundaries
-                                left_x1 = max(b['coordinate'][2] / ocr_scale for b in left_boxes)
-                                right_x0 = min(b['coordinate'][0] / ocr_scale for b in right_boxes)
-                                column_boundaries = {
-                                    'left': (0, left_x1 + 10),
-                                    'right': (right_x0 - 10, page_width)
-                                }
-                                logging.info(f"Page {page_num + 1}: 2-column layout: left 0-{left_x1:.0f}, right {right_x0:.0f}-{page_width:.0f}")
-                except Exception as e:
-                    logging.warning(f"Page {page_num + 1}: LayoutDetection failed: {e}")
             
             # ============================================
             # STEP 3: Run OCR
@@ -1460,11 +1498,10 @@ class PDFProcessor:
             logging.info(f"Page {page_num + 1}: OCR found {len(texts)} text regions")
             
             # ============================================
-            # STEP 4: Build text regions and assign columns
+            # STEP 4: Build text regions and assign columns dynamically
             # ============================================
             MIN_CONFIDENCE = 0.5
             text_regions = []
-            mid_x = page_width / 2
             
             for text, score, poly in zip(texts, scores, polys):
                 if score < MIN_CONFIDENCE or not text.strip():
@@ -1479,9 +1516,21 @@ class PDFProcessor:
                     center_x = (min(xs) + max(xs)) / 2
                     center_y = (min(ys) + max(ys)) / 2
                     
+                    # Find which column this region belongs to
                     column = 0
-                    if has_two_columns and center_x > mid_x:
-                        column = 1
+                    for col_idx, (col_x0, col_x1) in enumerate(column_boundaries):
+                        if col_x0 <= center_x <= col_x1:
+                            column = col_idx
+                            break
+                    else:
+                        # If not in any boundary, find closest column
+                        min_dist = float('inf')
+                        for col_idx, (col_x0, col_x1) in enumerate(column_boundaries):
+                            col_center = (col_x0 + col_x1) / 2
+                            dist = abs(center_x - col_center)
+                            if dist < min_dist:
+                                min_dist = dist
+                                column = col_idx
                     
                     text_regions.append({
                         'text': text.strip(),
@@ -1532,30 +1581,166 @@ class PDFProcessor:
             logging.info(f"Page {page_num + 1}: {len(all_lines)} lines in {len(columns_data)} column(s)")
             
             # ============================================
-            # STEP 6: Translate and prepare column content
+            # STEP 5.5: Group lines into PARAGRAPHS and fix hyphenation
             # ============================================
-            column_content = {0: [], 1: []}
+            import re
             
-            for col_idx, line_regions in all_lines:
-                line_regions.sort(key=lambda r: r['x0'])
-                line_text = ' '.join(r['text'] for r in line_regions)
+            def is_section_number(text):
+                """Check if text is just a section number like '4.6', '5.7', '2.1'"""
+                text = text.strip()
+                return bool(re.match(r'^\d+\.?\d*\.?\s*$', text))
+            
+            def is_title_or_heading(text):
+                """Detect if text is a title/heading (Article X, numbered sections, etc.)"""
+                text = text.strip()
+                # Article headers: "Article 1", "Article 2 - Title"
+                if re.match(r'^Article\s+\d+', text, re.IGNORECASE):
+                    return True
+                # Section numbers alone: "2.1", "4.6", "5.7" - these are headings
+                if re.match(r'^\d+\.\d+\.?\s*$', text):
+                    return True
+                # All caps titles
+                if text.isupper() and len(text) > 3:
+                    return True
+                return False
+            
+            def ends_sentence(text):
+                """Check if text ends with sentence-ending punctuation"""
+                text = text.strip()
+                return text.endswith('.') or text.endswith('!') or text.endswith('?') or text.endswith(':')
+            
+            def fix_hyphenation(line1, line2):
+                """Join hyphenated words across lines: 're-' + 'sponsible' -> 'responsible'"""
+                if line1.rstrip().endswith('-'):
+                    # Remove the hyphen and join with next word
+                    line1_fixed = line1.rstrip()[:-1]
+                    # Find first word of line2
+                    words = line2.split(None, 1)
+                    if words:
+                        first_word = words[0]
+                        rest = words[1] if len(words) > 1 else ''
+                        return line1_fixed + first_word, rest
+                return line1, line2
+            
+            def clean_inline_section_numbers(text):
+                """Remove section numbers that appear inline within text (margin annotations)"""
+                # Remove patterns like " 4.6 " or " 5.7 " that appear mid-text
+                # Pattern 1: number.number surrounded by text (not at line start)
+                cleaned = re.sub(r'(?<=\S)\s+\d+\.\d+\s+(?=\S)', ' ', text)
+                # Pattern 2: standalone single digit like " 5 " mid-sentence (page numbers, etc)
+                cleaned = re.sub(r'(?<=[a-zA-Z])\s+\d\s+(?=[A-Z])', ' ', cleaned)
+                # Pattern 3: number.number after punctuation and space
+                cleaned = re.sub(r'([.!?])\s+\d+\.\d+\s+', r'\1 ', cleaned)
+                # Also clean up multiple spaces
+                cleaned = re.sub(r'\s+', ' ', cleaned)
+                return cleaned.strip()
+            
+            # Build paragraphs from lines, respecting column boundaries
+            paragraphs_by_column = {i: [] for i in range(num_columns)}
+            
+            for col_idx in sorted(columns_data.keys()):
+                col_lines = [(idx, regions) for idx, regions in all_lines if idx == col_idx]
                 
-                line_bbox = pymupdf.Rect(
-                    min(r['bbox'].x0 for r in line_regions),
-                    min(r['bbox'].y0 for r in line_regions),
-                    max(r['bbox'].x1 for r in line_regions),
-                    max(r['bbox'].y1 for r in line_regions)
-                )
-                avg_height = sum(r['height'] for r in line_regions) / len(line_regions)
+                if not col_lines:
+                    continue
                 
-                translated = translator.translate(line_text)
-                if translated and translated.strip():
-                    column_content[col_idx].append({
-                        'y': line_bbox.y0,
-                        'text': translated.strip(),
-                        'height': avg_height,
-                        'original_bbox': line_bbox
+                current_paragraph_texts = []
+                current_paragraph_regions = []
+                
+                for _, line_regions in col_lines:
+                    line_regions_sorted = sorted(line_regions, key=lambda r: r['x0'])
+                    line_text = ' '.join(r['text'] for r in line_regions_sorted)
+                    
+                    # Skip lines that are just section numbers (margin annotations)
+                    if is_section_number(line_text):
+                        continue
+                    
+                    # Check if this is a title/heading - start new paragraph
+                    if is_title_or_heading(line_text):
+                        # Save current paragraph if exists
+                        if current_paragraph_texts:
+                            paragraphs_by_column[col_idx].append({
+                                'texts': current_paragraph_texts,
+                                'regions': current_paragraph_regions
+                            })
+                        # Title is its own paragraph
+                        paragraphs_by_column[col_idx].append({
+                            'texts': [line_text],
+                            'regions': line_regions_sorted
+                        })
+                        current_paragraph_texts = []
+                        current_paragraph_regions = []
+                        continue
+                    
+                    # Handle hyphenation with previous line
+                    if current_paragraph_texts:
+                        prev_text = current_paragraph_texts[-1]
+                        fixed_prev, fixed_current = fix_hyphenation(prev_text, line_text)
+                        current_paragraph_texts[-1] = fixed_prev
+                        line_text = fixed_current if fixed_current else line_text
+                    
+                    current_paragraph_texts.append(line_text)
+                    current_paragraph_regions.extend(line_regions_sorted)
+                    
+                    # Check if paragraph ends (sentence ends)
+                    if ends_sentence(line_text):
+                        paragraphs_by_column[col_idx].append({
+                            'texts': current_paragraph_texts,
+                            'regions': current_paragraph_regions
+                        })
+                        current_paragraph_texts = []
+                        current_paragraph_regions = []
+                
+                # Don't forget remaining text
+                if current_paragraph_texts:
+                    paragraphs_by_column[col_idx].append({
+                        'texts': current_paragraph_texts,
+                        'regions': current_paragraph_regions
                     })
+            
+            total_paragraphs = sum(len(p) for p in paragraphs_by_column.values())
+            logging.info(f"Page {page_num + 1}: {total_paragraphs} paragraphs grouped from {len(all_lines)} lines")
+            
+            # ============================================
+            # STEP 6: Translate PARAGRAPHS and prepare column content
+            # ============================================
+            column_content = {i: [] for i in range(num_columns)}
+            
+            for col_idx in sorted(paragraphs_by_column.keys()):
+                paragraphs = paragraphs_by_column[col_idx]
+                
+                for para in paragraphs:
+                    # Join all lines in paragraph with space
+                    para_text = ' '.join(para['texts'])
+                    # Clean up inline section numbers and extra spaces
+                    para_text = clean_inline_section_numbers(para_text)
+                    
+                    if not para_text:
+                        continue
+                    
+                    # Calculate bounding box for entire paragraph
+                    regions = para['regions']
+                    if not regions:
+                        continue
+                    
+                    para_bbox = pymupdf.Rect(
+                        min(r['bbox'].x0 for r in regions),
+                        min(r['bbox'].y0 for r in regions),
+                        max(r['bbox'].x1 for r in regions),
+                        max(r['bbox'].y1 for r in regions)
+                    )
+                    avg_height = sum(r['height'] for r in regions) / len(regions)
+                    
+                    # Translate the whole paragraph
+                    translated = translator.translate(para_text)
+                    if translated and translated.strip():
+                        column_content[col_idx].append({
+                            'y': para_bbox.y0,
+                            'text': translated.strip(),
+                            'height': avg_height,
+                            'original_bbox': para_bbox,
+                            'para_height': para_bbox.height  # Full paragraph height for text box
+                        })
             
             # ============================================
             # STEP 7: CREATE CLEAN PAGE and insert text
@@ -1566,21 +1751,9 @@ class PDFProcessor:
             # Clear everything - draw white rectangle over entire page
             new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
             
-            # Calculate column text areas
+            # Use detected column boundaries with small margin adjustments
             margin_top = 30
-            margin_left = 30
-            margin_right = 30
             line_spacing = 1.3
-            
-            if has_two_columns:
-                col0_x0 = margin_left
-                col0_x1 = column_boundaries['left'][1]
-                col1_x0 = column_boundaries['right'][0]
-                col1_x1 = page_width - margin_right
-            else:
-                col0_x0 = margin_left
-                col0_x1 = page_width - margin_right
-                col1_x0 = col1_x1 = 0
             
             # Insert translated text column by column
             total_inserted = 0
@@ -1590,28 +1763,30 @@ class PDFProcessor:
                 if not content:
                     continue
                 
-                # Determine column boundaries
-                if col_idx == 0:
-                    col_x0, col_x1 = col0_x0, col0_x1
+                # Get column boundaries from auto-detected list
+                if col_idx < len(column_boundaries):
+                    col_x0, col_x1 = column_boundaries[col_idx]
                 else:
-                    if not has_two_columns:
-                        continue
-                    col_x0, col_x1 = col1_x0, col1_x1
+                    # Fallback if column index out of range
+                    continue
                 
                 col_width = col_x1 - col_x0
                 if col_width < 50:
                     continue
                 
-                # Insert each line in column
+                # Insert each paragraph in column
                 for item in content:
                     y_pos = item['y']
                     text = item['text']
                     height = item['height']
+                    # Use full paragraph height if available
+                    para_height = item.get('para_height', height * line_spacing)
                     
-                    font_size = max(7, min(height * 0.85, 14))
+                    font_size = max(7, min(height * 0.85, 12))
                     
                     try:
-                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + height * line_spacing)
+                        # Use paragraph height for text box to allow multi-line text
+                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + max(para_height, height * 2))
                         
                         excess = new_page.insert_textbox(
                             text_rect,
@@ -1623,18 +1798,19 @@ class PDFProcessor:
                         )
                         
                         if excess < 0:
-                            # Text didn't fit, try smaller font
+                            # Text didn't fit, try smaller font and expand box
+                            expanded_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + para_height * 1.5)
                             new_page.insert_textbox(
-                                text_rect,
+                                expanded_rect,
                                 text,
-                                fontsize=max(6, font_size * 0.8),
+                                fontsize=max(6, font_size * 0.75),
                                 fontname="helv",
                                 color=text_color,
                                 align=0
                             )
                         total_inserted += 1
                     except Exception as e:
-                        logging.debug(f"Failed to insert line: {e}")
+                        logging.debug(f"Failed to insert paragraph: {e}")
             
             logging.info(f"Page {page_num + 1}: Clean page created with {total_inserted} translated lines")
             return new_doc
