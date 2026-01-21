@@ -6,625 +6,60 @@ SPAN-LEVEL FORMATTING PRESERVATION:
 This module now preserves formatting at the span level, not just line level.
 This means bold, italic, color, and size are tracked per-segment and
 intelligently mapped to the translated text using proportional allocation.
+
+PaddleOCR Configuration (v3.3.3 with PP-OCRv5):
+- Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug on CPU)
+- PP-OCRv5 provides best accuracy for scanned documents
+- Supports 80+ languages via 'lang' parameter
+- use_textline_orientation=True enables automatic text orientation detection
 """
 import logging
 import math
 import io
+import os
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import pymupdf
 from PIL import Image
 import numpy as np
 
+# Environment setup for PaddlePaddle CPU (must be before PaddleOCR import)
+os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
+
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
 
+# Import centralized configuration
+from .config import (
+    DEFAULT_OCR_CONFIG,
+    DEFAULT_TEXT_QUALITY_CONFIG,
+    DEFAULT_SCAN_DETECTION_CONFIG,
+    DEFAULT_PARAGRAPH_CONFIG,
+    PADDLEOCR_LANGUAGES,
+    LIGATURE_MAP,
+    QUOTE_MAP,
+    DASH_SPACE_MAP,
+)
 
-@dataclass
-class SpanFormat:
-    """
-    Represents the formatting attributes of a single text span.
-    
-    This is used to preserve inline formatting (bold, italic, color, size)
-    at the character/word level rather than the line level.
-    
-    Superscript/Subscript detection:
-    - PyMuPDF flag bit 0 (1) = superscript
-    - Subscript detected by: smaller font + positioned below baseline
-    - Also detected by relative size (< 80% of line average)
-    """
-    text: str
-    bbox: Tuple[float, float, float, float]
-    size: float
-    font: str
-    color: Tuple[float, float, float]  # RGB 0.0-1.0
-    flags: int = 0
-    line_avg_size: float = 0  # Average size of the line (for sub/super detection)
-    origin_y: float = 0  # Y position of text origin (baseline)
-    line_origin_y: float = 0  # Average baseline Y of the line
-    
-    @property
-    def is_bold(self) -> bool:
-        """Check if span is bold (flag bit 16 or 'Bold' in font name)."""
-        return bool(self.flags & 16) or 'Bold' in self.font or 'bold' in self.font.lower()
-    
-    @property
-    def is_italic(self) -> bool:
-        """Check if span is italic (flag bit 2 or 'Italic' in font name)."""
-        return bool(self.flags & 2) or 'Italic' in self.font or 'italic' in self.font.lower()
-    
-    @property
-    def is_superscript(self) -> bool:
-        """
-        Check if span is superscript.
-        
-        Detection methods:
-        1. PyMuPDF flag bit 0 (1) = superscript
-        2. Font size significantly smaller (< 80%) AND positioned above baseline
-        3. Font name contains 'Super' or 'Sup'
-        """
-        # Method 1: Flag
-        if bool(self.flags & 1):
-            return True
-        
-        # Method 2: Size + position based detection
-        if self.line_avg_size > 0 and self.size < self.line_avg_size * 0.8:
-            # Smaller font - check if above baseline
-            if self.line_origin_y > 0 and self.origin_y > 0:
-                # In PDF, Y increases downward, so superscript has SMALLER y (higher up)
-                if self.origin_y < self.line_origin_y - self.size * 0.3:
-                    return True
-        
-        # Method 3: Font name
-        font_lower = self.font.lower()
-        if 'super' in font_lower or 'sup' in font_lower:
-            return True
-        
-        return False
-    
-    @property
-    def is_subscript(self) -> bool:
-        """
-        Check if span is subscript.
-        
-        Detection methods:
-        1. Font size significantly smaller (< 80%) AND positioned below baseline
-        2. Font name contains 'Sub'
-        """
-        # Subscript has no standard flag, so we rely on heuristics
-        
-        # Method 1: Size + position based detection
-        if self.line_avg_size > 0 and self.size < self.line_avg_size * 0.8:
-            # Smaller font - check if below baseline
-            if self.line_origin_y > 0 and self.origin_y > 0:
-                # In PDF, Y increases downward, so subscript has LARGER y (lower down)
-                if self.origin_y > self.line_origin_y + self.size * 0.2:
-                    return True
-        
-        # Method 2: Font name
-        font_lower = self.font.lower()
-        if 'sub' in font_lower and 'subhead' not in font_lower:
-            return True
-        
-        return False
-    
-    @property
-    def is_monospace(self) -> bool:
-        """Check if font is monospace."""
-        mono_patterns = ['Courier', 'Mono', 'Consolas', 'Monaco', 'Menlo', 'Source Code']
-        return any(p.lower() in self.font.lower() for p in mono_patterns)
-    
-    @property
-    def is_serif(self) -> bool:
-        """Check if font is serif."""
-        serif_patterns = ['Times', 'Serif', 'Georgia', 'Garamond', 'Palatino', 'Cambria']
-        return any(p.lower() in self.font.lower() for p in serif_patterns)
-    
-    @property
-    def char_count(self) -> int:
-        """Number of characters in this span."""
-        return len(self.text)
-    
-    @property
-    def word_count(self) -> int:
-        """Number of words in this span."""
-        return len(self.text.split())
-    
-    def format_key(self) -> str:
-        """
-        Generate a unique key for this formatting style.
-        Used to detect when formatting changes between spans.
-        """
-        return f"{self.is_bold}|{self.is_italic}|{self.size:.1f}|{self.color}|{self.font[:10]}"
-    
-    def to_css_style(self) -> str:
-        """Generate inline CSS for this span's formatting."""
-        styles = []
-        
-        if self.is_bold:
-            styles.append("font-weight: bold")
-        if self.is_italic:
-            styles.append("font-style: italic")
-        
-        r, g, b = self.color
-        styles.append(f"color: rgb({int(r*255)}, {int(g*255)}, {int(b*255)})")
-        
-        return "; ".join(styles)
-    
-    def to_html_open_tag(self) -> str:
-        """Generate opening HTML tags for formatting."""
-        tags = []
-        if self.is_superscript:
-            tags.append("<sup>")
-        if self.is_subscript:
-            tags.append("<sub>")
-        if self.is_bold:
-            tags.append("<b>")
-        if self.is_italic:
-            tags.append("<i>")
-        return "".join(tags)
-    
-    def to_html_close_tag(self) -> str:
-        """Generate closing HTML tags (reverse order)."""
-        tags = []
-        if self.is_italic:
-            tags.append("</i>")
-        if self.is_bold:
-            tags.append("</b>")
-        if self.is_subscript:
-            tags.append("</sub>")
-        if self.is_superscript:
-            tags.append("</sup>")
-        return "".join(tags)
+# Import formatting classes
+from .formatting import SpanFormat, LineFormatInfo
+
+# Import formatting utilities
+from .format_utils import (
+    map_formatting_to_translation,
+    normalize_text_for_pdf as _normalize_text_for_pdf,
+    escape_html as _escape_html,
+)
+
+# Import OCR post-processing
+from .ocr_utils import clean_ocr_text, post_process_ocr_text
 
 
-@dataclass
-class LineFormatInfo:
-    """
-    Complete formatting information for a line, preserving span-level details.
-    
-    This replaces the old line_data dict with a proper structure that
-    maintains full span information for intelligent format mapping.
-    """
-    text: str
-    spans: List[SpanFormat]
-    merged_bbox: Tuple[float, float, float, float]
-    rotation: int = 0
-    wmode: int = 0
-    
-    @property
-    def avg_size(self) -> float:
-        """Average font size across all spans."""
-        if not self.spans:
-            return 11.0
-        total_chars = sum(s.char_count for s in self.spans)
-        if total_chars == 0:
-            return sum(s.size for s in self.spans) / len(self.spans)
-        return sum(s.size * s.char_count for s in self.spans) / total_chars
-    
-    @property
-    def dominant_color(self) -> Tuple[float, float, float]:
-        """Most common color in the line (by character count)."""
-        if not self.spans:
-            return (0, 0, 0)
-        color_chars: Dict[Tuple, int] = {}
-        for span in self.spans:
-            key = span.color
-            color_chars[key] = color_chars.get(key, 0) + span.char_count
-        return max(color_chars.keys(), key=lambda c: color_chars[c])
-    
-    @property
-    def has_mixed_formatting(self) -> bool:
-        """Check if line has multiple different formatting styles."""
-        if len(self.spans) <= 1:
-            return False
-        first_key = self.spans[0].format_key()
-        return any(s.format_key() != first_key for s in self.spans[1:])
-    
-    @property
-    def is_bold(self) -> bool:
-        """Check if majority of text is bold."""
-        if not self.spans:
-            return False
-        bold_chars = sum(s.char_count for s in self.spans if s.is_bold)
-        total_chars = sum(s.char_count for s in self.spans)
-        return bold_chars > total_chars / 2 if total_chars > 0 else False
-    
-    @property
-    def is_italic(self) -> bool:
-        """Check if majority of text is italic."""
-        if not self.spans:
-            return False
-        italic_chars = sum(s.char_count for s in self.spans if s.is_italic)
-        total_chars = sum(s.char_count for s in self.spans)
-        return italic_chars > total_chars / 2 if total_chars > 0 else False
-    
-    @property
-    def is_monospace(self) -> bool:
-        """Check if any span is monospace."""
-        return any(s.is_monospace for s in self.spans)
-    
-    @property
-    def is_serif(self) -> bool:
-        """Check if majority of text is serif."""
-        if not self.spans:
-            return False
-        serif_chars = sum(s.char_count for s in self.spans if s.is_serif)
-        total_chars = sum(s.char_count for s in self.spans)
-        return serif_chars > total_chars / 2 if total_chars > 0 else False
-    
-    def get_formatting_segments(self) -> List[Tuple[str, SpanFormat]]:
-        """
-        Get list of (text, format) pairs for each span.
-        Consecutive spans with same formatting are merged.
-        """
-        if not self.spans:
-            return []
-        
-        segments = []
-        current_format = self.spans[0]
-        current_text = self.spans[0].text
-        
-        for span in self.spans[1:]:
-            if span.format_key() == current_format.format_key():
-                # Same formatting, merge text
-                current_text += " " + span.text
-            else:
-                # Different formatting, save current and start new
-                segments.append((current_text, current_format))
-                current_format = span
-                current_text = span.text
-        
-        # Don't forget the last segment
-        segments.append((current_text, current_format))
-        return segments
-    
-    def to_legacy_dict(self) -> dict:
-        """
-        Convert to legacy line_data dict format for backward compatibility.
-        This allows gradual migration of the codebase.
-        """
-        return {
-            'text': self.text,
-            'bboxes': [s.bbox for s in self.spans],
-            'sizes': [s.size for s in self.spans],
-            'fonts': [s.font for s in self.spans],
-            'colors': [s.color for s in self.spans],
-            'dominant_color': self.dominant_color,
-            'merged_bbox': self.merged_bbox,
-            'avg_size': self.avg_size,
-            'is_bold': self.is_bold,
-            'is_italic': self.is_italic,
-            'is_serif': self.is_serif,
-            'is_monospace': self.is_monospace,
-            'rotation': self.rotation,
-            'wmode': self.wmode,
-            # NEW: Include span-level info for intelligent formatting
-            'spans': self.spans,
-            'has_mixed_formatting': self.has_mixed_formatting,
-        }
+# NOTE: SpanFormat and LineFormatInfo classes moved to formatting.py
+# NOTE: map_formatting_to_translation and helpers moved to format_utils.py
+# NOTE: detect_title_or_heading moved to format_utils.py (simplified version)
 
-
-def map_formatting_to_translation(
-    original_segments: List[Tuple[str, SpanFormat]],
-    translated_text: str
-) -> str:
-    """
-    Intelligently map original formatting to translated text.
-    
-    This is the core algorithm for preserving inline formatting.
-    It uses multiple strategies to apply bold/italic/color
-    to the appropriate parts of the translated text.
-    
-    Strategies (in order of preference):
-    1. KEYWORD MATCHING: If a formatted segment is a single word that appears
-       (or has a similar form) in the translation, format that word directly.
-    2. PROPORTIONAL MAPPING: Distribute formatting based on word ratios.
-    
-    Args:
-        original_segments: List of (text, SpanFormat) from original line
-        translated_text: The translated text to apply formatting to
-        
-    Returns:
-        HTML-formatted string with inline formatting preserved
-    """
-    if not original_segments:
-        return translated_text
-    
-    # Single segment with no special formatting = no HTML needed
-    if len(original_segments) == 1:
-        fmt = original_segments[0][1]
-        if not fmt.is_bold and not fmt.is_italic:
-            return translated_text
-        # Apply full formatting
-        return fmt.to_html_open_tag() + _escape_html(translated_text) + fmt.to_html_close_tag()
-    
-    # Merge consecutive segments with same formatting for cleaner output
-    merged_segments = _merge_adjacent_formats(original_segments)
-    
-    # If all merged into one, check if we need formatting
-    if len(merged_segments) == 1:
-        fmt = merged_segments[0][1]
-        if not fmt.is_bold and not fmt.is_italic:
-            return translated_text
-        return fmt.to_html_open_tag() + _escape_html(translated_text) + fmt.to_html_close_tag()
-    
-    # STRATEGY 1: Try keyword matching for single-word formatted segments
-    result = _try_keyword_matching(merged_segments, translated_text)
-    if result is not None:
-        return result
-    
-    # STRATEGY 2: Proportional word-based mapping
-    return _proportional_word_mapping(merged_segments, translated_text)
-
-
-def _try_keyword_matching(
-    segments: List[Tuple[str, SpanFormat]],
-    translated_text: str
-) -> Optional[str]:
-    """
-    Try to match formatted keywords in the translated text.
-    
-    This works best when:
-    - A formatted segment is a single word or short phrase
-    - That word/phrase appears (or is similar) in the translation
-    - Common for technical terms, proper nouns, emphasized words
-    
-    Returns:
-        HTML-formatted string if matching successful, None otherwise
-    """
-    translated_words = translated_text.split()
-    translated_lower = translated_text.lower()
-    
-    # Find formatted segments that are single words or short phrases
-    formatted_segments = [
-        (text, fmt, i) for i, (text, fmt) in enumerate(segments)
-        if (fmt.is_bold or fmt.is_italic) and len(text.split()) <= 3
-    ]
-    
-    if not formatted_segments:
-        return None
-    
-    # Track which translated words should be formatted
-    word_formats: Dict[int, SpanFormat] = {}
-    matched_any = False
-    
-    for orig_text, fmt, seg_idx in formatted_segments:
-        orig_lower = orig_text.lower().strip()
-        orig_words = orig_text.split()
-        
-        # Try to find matching words in translation
-        for t_idx, t_word in enumerate(translated_words):
-            t_lower = t_word.lower().strip('.,;:!?"\'"()-')
-            
-            # Match strategies:
-            # 1. Exact match (case-insensitive)
-            # 2. Start match (translated word starts with original)
-            # 3. Original is contained in translation
-            if (t_lower == orig_lower or
-                t_lower.startswith(orig_lower[:min(4, len(orig_lower))]) or
-                orig_lower in t_lower or
-                _is_similar_word(orig_lower, t_lower)):
-                
-                if t_idx not in word_formats:
-                    word_formats[t_idx] = fmt
-                    matched_any = True
-                    break  # Found a match for this segment
-    
-    if not matched_any:
-        return None
-    
-    # Build output with matched formatting
-    result_parts = []
-    current_fmt = None
-    current_words = []
-    
-    for i, word in enumerate(translated_words):
-        fmt = word_formats.get(i)
-        
-        if fmt is not None:
-            # This word has formatting
-            if current_words:
-                # Flush previous unformatted words
-                result_parts.append(_escape_html(" ".join(current_words)))
-                current_words = []
-            
-            # Add formatted word
-            result_parts.append(fmt.to_html_open_tag() + _escape_html(word) + fmt.to_html_close_tag())
-        else:
-            # Unformatted word
-            current_words.append(word)
-    
-    # Flush remaining words
-    if current_words:
-        result_parts.append(_escape_html(" ".join(current_words)))
-    
-    return " ".join(result_parts)
-
-
-def _is_similar_word(word1: str, word2: str) -> bool:
-    """
-    Check if two words are similar (for matching across languages).
-    
-    Handles:
-    - Similar roots (import -> importante)
-    - Shared prefix of sufficient length
-    """
-    if not word1 or not word2:
-        return False
-    
-    # Minimum 4 char shared prefix for similarity
-    min_len = min(len(word1), len(word2))
-    if min_len < 3:
-        return False
-    
-    prefix_len = min(6, min_len)
-    return word1[:prefix_len] == word2[:prefix_len]
-
-
-def _proportional_word_mapping(
-    merged_segments: List[Tuple[str, SpanFormat]],
-    translated_text: str
-) -> str:
-    """
-    Fallback: Distribute formatting proportionally based on word counts.
-    """
-    # Calculate word counts for each original segment
-    original_word_counts = [len(text.split()) for text, _ in merged_segments]
-    total_original_words = sum(original_word_counts)
-    
-    if total_original_words == 0:
-        return translated_text
-    
-    # Split translated text into words
-    translated_words = translated_text.split()
-    if not translated_words:
-        return translated_text
-    
-    total_translated_words = len(translated_words)
-    
-    # Calculate ideal word counts for each segment
-    ideal_distribution = []
-    for i, (orig_text, fmt) in enumerate(merged_segments):
-        proportion = original_word_counts[i] / total_original_words
-        ideal_count = proportion * total_translated_words
-        ideal_distribution.append(ideal_count)
-    
-    # Allocate words
-    word_distribution = []
-    allocated = 0
-    
-    for i, ideal in enumerate(ideal_distribution):
-        if i == len(ideal_distribution) - 1:
-            word_count = total_translated_words - allocated
-        else:
-            word_count = max(1, round(ideal))
-            max_available = total_translated_words - allocated - (len(ideal_distribution) - i - 1)
-            word_count = min(word_count, max_available)
-        
-        word_distribution.append(word_count)
-        allocated += word_count
-    
-    # Build HTML output
-    html_parts = []
-    word_idx = 0
-    
-    for i, (orig_text, fmt) in enumerate(merged_segments):
-        words_for_segment = word_distribution[i]
-        segment_words = translated_words[word_idx:word_idx + words_for_segment]
-        word_idx += words_for_segment
-        
-        if not segment_words:
-            continue
-        
-        segment_text = " ".join(segment_words)
-        
-        if fmt.is_bold or fmt.is_italic:
-            html_parts.append(fmt.to_html_open_tag() + _escape_html(segment_text) + fmt.to_html_close_tag())
-        else:
-            html_parts.append(_escape_html(segment_text))
-    
-    return " ".join(html_parts)
-
-
-def _merge_adjacent_formats(
-    segments: List[Tuple[str, SpanFormat]]
-) -> List[Tuple[str, SpanFormat]]:
-    """
-    Merge adjacent segments that have the same formatting.
-    
-    This simplifies the output by combining consecutive spans that
-    would produce identical HTML tags.
-    
-    Example:
-        [("Hello", bold), ("world", bold)] -> [("Hello world", bold)]
-    """
-    if len(segments) <= 1:
-        return segments
-    
-    merged = []
-    current_text, current_fmt = segments[0]
-    
-    for text, fmt in segments[1:]:
-        if fmt.format_key() == current_fmt.format_key():
-            # Same formatting, merge text
-            current_text = current_text + " " + text
-        else:
-            # Different formatting, save current and start new
-            merged.append((current_text, current_fmt))
-            current_text, current_fmt = text, fmt
-    
-    # Don't forget the last segment
-    merged.append((current_text, current_fmt))
-    return merged
-
-
-def _escape_html(text: str) -> str:
-    """Escape HTML special characters."""
-    return (text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;"))
-
-
-def detect_title_or_heading(line_info: LineFormatInfo, all_lines: List[LineFormatInfo]) -> bool:
-    """
-    Detect if a line is likely a title or heading.
-    
-    Heuristics:
-    - Larger font size than average
-    - Bold formatting
-    - All caps or title case
-    - Short length (headings are usually short)
-    - Centered position (if we have layout info)
-    
-    Args:
-        line_info: The line to analyze
-        all_lines: All lines in the block for comparison
-        
-    Returns:
-        True if the line appears to be a title/heading
-    """
-    if not all_lines:
-        return False
-    
-    # Calculate average size across all lines
-    avg_sizes = [l.avg_size for l in all_lines if l.avg_size > 0]
-    if not avg_sizes:
-        return False
-    
-    overall_avg_size = sum(avg_sizes) / len(avg_sizes)
-    
-    # Heading indicators
-    indicators = 0
-    
-    # 1. Larger font (at least 20% bigger than average)
-    if line_info.avg_size > overall_avg_size * 1.2:
-        indicators += 2
-    
-    # 2. Bold text
-    if line_info.is_bold:
-        indicators += 1
-    
-    # 3. Short text (less than 60 characters)
-    if len(line_info.text) < 60:
-        indicators += 1
-    
-    # 4. All caps or Title Case
-    text = line_info.text.strip()
-    if text.isupper() and len(text) > 3:
-        indicators += 2
-    elif text.istitle() and len(text.split()) <= 8:
-        indicators += 1
-    
-    # 5. No ending punctuation (headings often don't have periods)
-    if text and text[-1] not in '.!?;:':
-        indicators += 1
-    
-    return indicators >= 3
 
 # OCR and Document Analysis imports
 try:
@@ -669,17 +104,6 @@ class PDFProcessor:
     - Better handling of complex layouts
     - Automatic text detection (finds text regions)
     """
-    
-    # PaddleOCR language codes
-    PADDLEOCR_LANGUAGES = {
-        "Italiano": "it",
-        "English": "en",
-        "Español": "es",
-        "Français": "fr",
-        "Deutsch": "de",
-        "Português": "pt",
-        "Nederlands": "nl",  # Using multilingual model
-    }
     
     # Singleton PaddleOCR instance (lazy loading)
     _ocr_engine = None
@@ -981,18 +405,21 @@ class PDFProcessor:
     
     @classmethod
     def _get_ocr_engine(cls, language: str):
-        """Get or create PaddleOCR engine (singleton with language caching)."""
+        """Get or create PaddleOCR engine (singleton with language caching).
+        
+        Uses PP-OCRv5 models for best accuracy on CPU.
+        Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug).
+        """
         if cls._ocr_engine is None or cls._current_lang != language:
-            logging.info(f"Initializing PaddleOCR for language: {language}")
+            logging.info(f"Initializing PaddleOCR PP-OCRv5 for language: {language}")
             try:
-                # Modern PaddleOCR API (v3+)
+                # PaddleOCR 3.3.3 API with PP-OCRv5 (best quality on CPU)
                 cls._ocr_engine = PaddleOCR(
                     lang=language,
-                    text_det_thresh=0.3,  # Detection threshold (lower = more sensitive)
-                    text_det_box_thresh=0.5,  # Bounding box threshold
+                    use_textline_orientation=True,  # Auto-detect text orientation
                 )
                 cls._current_lang = language
-                logging.info(f"✓ PaddleOCR initialized for {language}")
+                logging.info(f"✓ PaddleOCR PP-OCRv5 initialized for {language}")
             except Exception as e:
                 logging.error(f"Failed to initialize PaddleOCR: {e}")
                 cls._ocr_engine = None
@@ -1184,16 +611,19 @@ class PDFProcessor:
             paragraphs = self._group_into_paragraphs(column_regions)
             all_paragraphs.extend(paragraphs)
         
-        # Step 4: Build final text
+        # Step 4: Build final text with OCR post-processing
         result_parts = []
         for para in all_paragraphs:
             para_text = ' '.join(para)
             if para_text.strip():
-                result_parts.append(para_text.strip())
+                # Apply OCR post-processing to fix common errors (MimakI -> Mimaki, etc.)
+                para_text = clean_ocr_text(para_text.strip())
+                result_parts.append(para_text)
         
         # Add unpositioned text at the end
         if unpositioned:
             unpositioned_text = ' '.join(r['text'] for r in unpositioned)
+            unpositioned_text = clean_ocr_text(unpositioned_text)
             result_parts.append(unpositioned_text)
         
         # Join paragraphs with double newline
@@ -1714,6 +1144,8 @@ class PDFProcessor:
                     para_text = ' '.join(para['texts'])
                     # Clean up inline section numbers and extra spaces
                     para_text = clean_inline_section_numbers(para_text)
+                    # Apply OCR post-processing to fix common errors
+                    para_text = clean_ocr_text(para_text)
                     
                     if not para_text:
                         continue
@@ -2961,4 +2393,4 @@ class PDFProcessor:
     @classmethod
     def get_ocr_language(cls, language_name: str) -> str:
         """Get PaddleOCR language code from language name."""
-        return cls.PADDLEOCR_LANGUAGES.get(language_name, "en")
+        return PADDLEOCR_LANGUAGES.get(language_name, "en")

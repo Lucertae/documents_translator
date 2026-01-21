@@ -13,9 +13,9 @@ sentencepiece>=0.2.0
 torch>=2.0.0
 sacremoses>=0.1.0
 
-# OCR (Optical Character Recognition) - PaddleOCR (superior quality & speed)
-paddleocr>=2.7.0
-paddlepaddle>=2.5.0  # CPU version (lightweight)
+# OCR (Optical Character Recognition) - PaddleOCR PP-OCRv5 (best quality)
+paddleocr>=3.3.0
+paddlepaddle>=3.2.0,<3.3.0  # CPU version - 3.2.x stable, 3.3.0 has ONEDNN bug
 pdf2image>=1.16.3
 
 # Legacy OCR (deprecated)
