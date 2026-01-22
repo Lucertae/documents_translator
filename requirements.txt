@@ -21,6 +21,7 @@ pdf2image>=1.16.3
 # Required by PaddleOCR/PaddlePaddle
 scipy>=1.10.0
 opencv-python>=4.8.0
+onnxruntime>=1.16.0  # Required for PaddlePaddle inference on Windows
 
 # Qt6 GUI Framework
 PySide6>=6.6.0

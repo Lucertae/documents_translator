@@ -419,9 +419,21 @@ class PDFProcessor:
                     use_textline_orientation=True,  # Auto-detect text orientation
                 )
                 cls._current_lang = language
-                logging.info(f"✓ PaddleOCR PP-OCRv5 initialized for {language}")
+                logging.info(f"[OK] PaddleOCR PP-OCRv5 initialized for {language}")
             except Exception as e:
-                logging.error(f"Failed to initialize PaddleOCR: {e}")
+                error_msg = str(e)
+                logging.error(f"Failed to initialize PaddleOCR: {error_msg}")
+                if "dependency error" in error_msg.lower() or "predictor creation" in error_msg.lower():
+                    logging.error("=" * 60)
+                    logging.error("PaddleOCR DEPENDENCY ERROR - Scanned PDFs not supported")
+                    logging.error("This document appears to be a scanned image.")
+                    logging.error("OCR requires additional Windows dependencies.")
+                    logging.error("")
+                    logging.error("SOLUTION: Use the Python version instead of the EXE:")
+                    logging.error("  1. Install Python 3.11")
+                    logging.error("  2. pip install -r requirements.txt")
+                    logging.error("  3. python app/main_qt.py")
+                    logging.error("=" * 60)
                 cls._ocr_engine = None
         return cls._ocr_engine
     
@@ -434,9 +446,12 @@ class PDFProcessor:
             logging.info("Initializing LayoutDetection engine...")
             try:
                 cls._layout_engine = LayoutDetection()
-                logging.info("✓ LayoutDetection initialized")
+                logging.info("[OK] LayoutDetection initialized")
             except Exception as e:
-                logging.error(f"Failed to initialize LayoutDetection: {e}")
+                error_msg = str(e)
+                if "dependency error" not in error_msg.lower():
+                    logging.error(f"Failed to initialize LayoutDetection: {e}")
+                cls._layout_engine = None
                 cls._layout_engine = None
         return cls._layout_engine
     
@@ -449,7 +464,7 @@ class PDFProcessor:
             logging.info("Initializing DocPreprocessor engine...")
             try:
                 cls._doc_preprocessor = DocPreprocessor()
-                logging.info("✓ DocPreprocessor initialized")
+                logging.info("[OK] DocPreprocessor initialized")
             except Exception as e:
                 logging.error(f"Failed to initialize DocPreprocessor: {e}")
                 cls._doc_preprocessor = None
@@ -464,7 +479,7 @@ class PDFProcessor:
             logging.info("Initializing PPStructureV3 engine...")
             try:
                 cls._pp_structure = PPStructureV3()
-                logging.info("✓ PPStructureV3 initialized")
+                logging.info("[OK] PPStructureV3 initialized")
             except Exception as e:
                 logging.error(f"Failed to initialize PPStructureV3: {e}")
                 cls._pp_structure = None
@@ -1944,7 +1959,7 @@ class PDFProcessor:
             if result[0] < 0:
                 # spare_height=-1 means text didn't fit even with shrinking
                 logging.warning(f"Text didn't fit in bbox {merged_bbox}, scale={result[1]:.2f}")
-            logging.debug(f"✓ Formatted HTML insertion successful (rotation={rotation}°, scale={result[1]:.2f})")
+            logging.debug(f"[OK] Formatted HTML insertion successful (rotation={rotation}°, scale={result[1]:.2f})")
         except Exception as e:
             logging.warning(f"Formatted HTML insertion failed: {e}, falling back to plain text")
             # Fallback to plain text without formatting
@@ -2445,9 +2460,9 @@ class PDFProcessor:
                 )
                 
                 if rotation != 0:
-                    logging.debug(f"✓ Rotated text insertion successful (rotation={rotation}°)")
+                    logging.debug(f"[OK] Rotated text insertion successful (rotation={rotation}°)")
                 else:
-                    logging.debug(f"✓ Text insertion successful (primary)")
+                    logging.debug(f"[OK] Text insertion successful (primary)")
                 return
                 
             except Exception as e:
@@ -2494,9 +2509,9 @@ class PDFProcessor:
             
             page.insert_htmlbox(merged_bbox, translated_text, css=css, rotate=rotation)
             if rotation != 0:
-                logging.debug(f"✓ HTML insertion successful (wrap={needs_wrapping}, rotation={rotation}°)")
+                logging.debug(f"[OK] HTML insertion successful (wrap={needs_wrapping}, rotation={rotation}°)")
             else:
-                logging.debug(f"✓ HTML insertion successful (wrap={needs_wrapping})")
+                logging.debug(f"[OK] HTML insertion successful (wrap={needs_wrapping})")
             return
             
         except Exception as e:
@@ -2526,7 +2541,7 @@ class PDFProcessor:
                     fontname=pdf_font,
                     rotate=rotation
                 )
-                logging.debug(f"✓ Truncated text insertion successful (rotation={rotation}°)")
+                logging.debug(f"[OK] Truncated text insertion successful (rotation={rotation}°)")
             except Exception as final_error:
                 logging.error(f"All insertion methods failed: {final_error}")
     

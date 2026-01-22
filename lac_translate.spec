@@ -54,6 +54,18 @@ try:
 except Exception as e:
     print(f"Warning: Could not collect paddleocr dynamic libs: {e}")
 
+# ONNX Runtime (required by PaddlePaddle inference)
+try:
+    binaries += collect_dynamic_libs('onnxruntime')
+except Exception as e:
+    print(f"Warning: Could not collect onnxruntime dynamic libs: {e}")
+
+# OpenCV binaries
+try:
+    binaries += collect_dynamic_libs('cv2')
+except Exception as e:
+    print(f"Warning: Could not collect cv2 dynamic libs: {e}")
+
 # Include app resources (with existence checks for CI compatibility)
 app_resources = [
     ('app/deep_translator', 'app/deep_translator'),
@@ -120,6 +132,10 @@ hiddenimports = [
     # OpenCV (used by PaddleOCR)
     'cv2',
     
+    # ONNX Runtime (required by PaddlePaddle inference)
+    'onnxruntime',
+    'onnxruntime.capi',
+    
     # Numpy/Scipy
     'numpy',
     'scipy',
@@ -152,6 +168,8 @@ hiddenimports += collect_submodules('paddle')
 hiddenimports += collect_submodules('paddleocr')
 hiddenimports += collect_submodules('paddlex')
 hiddenimports += collect_submodules('scipy')
+hiddenimports += collect_submodules('onnxruntime')
+hiddenimports += collect_submodules('cv2')
 
 # Exclude unnecessary modules to reduce size
 excludes = [

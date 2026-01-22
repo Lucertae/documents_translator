@@ -308,7 +308,7 @@ class TranslationEngine:
             # Cache the model
             cls._model_cache[lang_pair] = (model, tokenizer)
             
-            logging.info(f"✓ OPUS-MT model loaded: {source_lang} → {target_lang}")
+            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} → {target_lang}")
             
         except Exception as e:
             logging.error(f"Failed to load OPUS-MT model: {e}")

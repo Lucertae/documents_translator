@@ -421,7 +421,7 @@ class PDFTranslatorGUI:
         
         self.status_bar = tk.Label(
             status_frame, 
-            text="✓ Pronto - LAC TRANSLATE", 
+            text="[OK] Pronto - LAC TRANSLATE", 
             bg=self.colors['bg_light'],
             fg=self.colors['success'],
             anchor=tk.W,
@@ -465,7 +465,7 @@ class PDFTranslatorGUI:
                 # Controlla se il testo è sufficiente per una buona traduzione
                 text_length = len(sample_text.strip())
                 if text_length > 100:
-                    self.update_status(f"✓ PDF caricato: {self.current_doc.page_count} pagine - {text_length} caratteri estratti")
+                    self.update_status(f"[OK] PDF caricato: {self.current_doc.page_count} pagine - {text_length} caratteri estratti")
                 else:
                     self.update_status(f"⚠ PDF caricato: {self.current_doc.page_count} pagine - testo limitato ({text_length} caratteri)")
             
@@ -945,7 +945,7 @@ class PDFTranslatorGUI:
                 
                 self.progress.stop()
                 self.progress.pack_forget()
-                self.update_status(f"✓ Pagina {self.current_page + 1} tradotta")
+                self.update_status(f"[OK] Pagina {self.current_page + 1} tradotta")
                 
             except Exception as e:
                 self.progress.stop()
@@ -995,8 +995,8 @@ class PDFTranslatorGUI:
                 
                 self.progress.stop()
                 self.progress.pack_forget()
-                self.update_status(f"✓ Tradotte tutte le {total_pages} pagine!")
-                messagebox.showinfo("Completato", f"✓ Tradotte tutte le {total_pages} pagine!")
+                self.update_status(f"[OK] Tradotte tutte le {total_pages} pagine!")
+                messagebox.showinfo("Completato", f"[OK] Tradotte tutte le {total_pages} pagine!")
                 
             except Exception as e:
                 self.progress.stop()
@@ -1046,9 +1046,9 @@ class PDFTranslatorGUI:
                     clean=True
                 )
                 
-                self.update_status(f"✓ Salvato: {os.path.basename(output_path)}")
+                self.update_status(f"[OK] Salvato: {os.path.basename(output_path)}")
                 logging.info(f"Saved translated PDF: {output_path}")
-                messagebox.showinfo("Successo", f"✓ PDF salvato:\n{output_path}")
+                messagebox.showinfo("Successo", f"[OK] PDF salvato:\n{output_path}")
             except Exception as e:
                 messagebox.showerror("Errore", f"Impossibile salvare PDF: {str(e)}")
                 logging.error(f"Failed to save PDF: {str(e)}")
@@ -1064,7 +1064,7 @@ class PDFTranslatorGUI:
         }
         
         # Detect status type from message
-        if message.startswith('✓') or 'completat' in message.lower() or 'salvat' in message.lower():
+        if message.startswith('[OK]') or 'completat' in message.lower() or 'salvat' in message.lower():
             status_type = 'success'
         elif message.startswith('✗') or 'error' in message.lower() or 'fallita' in message.lower():
             status_type = 'error'
