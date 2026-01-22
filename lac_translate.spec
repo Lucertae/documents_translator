@@ -33,13 +33,17 @@ try:
 except Exception:
     pass
 
-# Include app resources
-datas += [
+# Include app resources (with existence checks for CI compatibility)
+import os
+app_resources = [
     ('app/deep_translator', 'app/deep_translator'),
     ('logs/README.txt', 'logs'),
     ('output/README.txt', 'output'),
     ('assets/icon.png', 'assets'),
 ]
+for src, dst in app_resources:
+    if os.path.exists(src):
+        datas.append((src, dst))
 
 # Hidden imports for dynamic loading
 hiddenimports = [

@@ -49,6 +49,100 @@ Prima di eseguirlo:
 3. **Ricorda**: il programma deve funzionare in modo eccellente per **qualsiasi documento**
 4. **Segui le best practice** - non fare modifiche affrettate
 
+---
+
+### 🔬 Controllo Qualità Codice
+
+Ogni iterazione DEVE includere verifiche sulla qualità del codice:
+
+#### 1. Dimensione e Complessità
+
+```bash
+# Conta linee di codice (esclusi commenti e righe vuote)
+find app -name "*.py" -exec cat {} \; | grep -v '^\s*#' | grep -v '^\s*$' | wc -l
+
+# Analisi complessità con radon
+pip install radon
+radon cc app/core/*.py -a -s  # Complessità ciclomatica
+radon mi app/core/*.py -s     # Maintainability Index
+
+# Target:
+# - Complessità ciclomatica media: A o B (≤10)
+# - Maintainability Index: >65 (buono), >85 (eccellente)
+```
+
+#### 2. Codice Morto e Import Inutilizzati
+
+```bash
+# Trova import non usati
+pip install autoflake
+autoflake --check --remove-all-unused-imports app/core/*.py
+
+# Trova codice morto con vulture
+pip install vulture
+vulture app/core/ --min-confidence 80
+
+# Rimuovi import inutilizzati (dry-run prima!)
+autoflake --in-place --remove-all-unused-imports app/core/*.py
+```
+
+#### 3. Duplicazione Codice
+
+```bash
+# Analisi duplicati con pylint
+pylint app/core/*.py --disable=all --enable=duplicate-code
+
+# Oppure con CPD (Copy-Paste Detector) - più dettagliato
+pip install flake8 flake8-pep3101
+# O usa: https://github.com/jscpd/jscpd (npm install -g jscpd)
+jscpd app/core/ --min-lines 5 --min-tokens 50
+
+# Target: <5% duplicazione
+```
+
+#### 4. Type Checking e Linting
+
+```bash
+# Type checking con mypy
+pip install mypy
+mypy app/core/*.py --ignore-missing-imports
+
+# Linting completo con ruff (più veloce di flake8+pylint)
+pip install ruff
+ruff check app/core/
+
+# Fix automatico problemi semplici
+ruff check app/core/ --fix
+```
+
+#### 5. Checklist Controllo Codice
+
+Prima di ogni commit, verifica:
+
+| Check | Comando | Target |
+|-------|---------|--------|
+| Import inutilizzati | `autoflake --check` | 0 |
+| Codice morto | `vulture --min-confidence 80` | 0 falsi positivi |
+| Duplicazione | `pylint --enable=duplicate-code` | <5% |
+| Complessità | `radon cc -a` | Media ≤10 (A/B) |
+| Type errors | `mypy` | 0 errori |
+| Linting | `ruff check` | 0 errori |
+| LOC variazione | `wc -l` | Giustificata |
+
+#### 6. Monitoraggio Crescita Codebase
+
+```bash
+# Snapshot dimensioni attuali
+echo "=== Snapshot Codebase ===" > code_metrics.txt
+date >> code_metrics.txt
+echo "LOC per file:" >> code_metrics.txt
+find app -name "*.py" -exec wc -l {} \; | sort -n >> code_metrics.txt
+echo "Totale:" >> code_metrics.txt
+find app -name "*.py" -exec cat {} \; | wc -l >> code_metrics.txt
+```
+
+**Regola d'oro**: Se una modifica aumenta le LOC >10% senza nuove feature, probabilmente c'è refactoring da fare.
+
 ```bash
 # Test mirato su UN documento specifico (rapido)
 python -c "
