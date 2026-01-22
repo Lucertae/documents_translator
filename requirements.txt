@@ -18,13 +18,10 @@ paddleocr>=3.3.0
 paddlepaddle>=3.2.0,<3.3.0  # CPU version - 3.2.x stable, 3.3.0 has ONEDNN bug
 pdf2image>=1.16.3
 
-# Legacy OCR (deprecated)
-# pytesseract>=0.3.10
+# Required by PaddleOCR/PaddlePaddle
+scipy>=1.10.0
+opencv-python>=4.8.0
 
 # Qt6 GUI Framework
 PySide6>=6.6.0
-
-# Legacy (deprecated, will be removed)
-# argostranslate>=1.9.0
-# deep-translator>=1.11.4
 

@@ -151,6 +151,7 @@ hiddenimports += collect_submodules('PySide6')
 hiddenimports += collect_submodules('paddle')
 hiddenimports += collect_submodules('paddleocr')
 hiddenimports += collect_submodules('paddlex')
+hiddenimports += collect_submodules('scipy')
 
 # Exclude unnecessary modules to reduce size
 excludes = [
