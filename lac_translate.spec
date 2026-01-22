@@ -4,8 +4,9 @@ LAC Translate - PyInstaller Build Specification (Windows & Linux)
 """
 
 import sys
+import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
 
 block_cipher = None
 
@@ -21,20 +22,39 @@ datas += collect_data_files('transformers', include_py_files=False)
 # SentencePiece
 datas += collect_data_files('sentencepiece', include_py_files=False)
 
+# PaddlePaddle - CRITICAL: include all data files and libs
+try:
+    datas += collect_data_files('paddle', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddle data files: {e}")
+
 # PaddleOCR resources
 try:
-    datas += collect_data_files('paddleocr', include_py_files=False)
-except Exception:
-    pass
+    datas += collect_data_files('paddleocr', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddleocr data files: {e}")
 
-# PaddleX resources (required by PaddleOCR)
+# PaddleX resources (required by PaddleOCR v3+)
 try:
-    datas += collect_data_files('paddlex', include_py_files=False)
-except Exception:
-    pass
+    datas += collect_data_files('paddlex', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddlex data files: {e}")
+
+# Collect binaries/dynamic libraries
+binaries = []
+
+# PaddlePaddle dynamic libraries (critical for Windows)
+try:
+    binaries += collect_dynamic_libs('paddle')
+except Exception as e:
+    print(f"Warning: Could not collect paddle dynamic libs: {e}")
+
+try:
+    binaries += collect_dynamic_libs('paddleocr')
+except Exception as e:
+    print(f"Warning: Could not collect paddleocr dynamic libs: {e}")
 
 # Include app resources (with existence checks for CI compatibility)
-import os
 app_resources = [
     ('app/deep_translator', 'app/deep_translator'),
     ('logs/README.txt', 'logs'),
@@ -72,9 +92,47 @@ hiddenimports = [
     'PIL.Image',
     'pdf2image',
     
+    # PaddlePaddle - ALL required modules
+    'paddle',
+    'paddle.fluid',
+    'paddle.inference',
+    'paddle.base',
+    'paddle.framework',
+    'paddle.utils',
+    'paddle.device',
+    'paddle.nn',
+    'paddle.optimizer',
+    'paddle.io',
+    'paddle.vision',
+    'paddle.distributed',
+    
     # PaddleOCR
     'paddleocr',
-    'paddle',
+    'paddleocr.paddleocr',
+    
+    # PaddleX (required by PaddleOCR v3+)
+    'paddlex',
+    'paddlex.inference',
+    'paddlex.inference.pipelines',
+    'paddlex.inference.models',
+    'paddlex.modules',
+    
+    # OpenCV (used by PaddleOCR)
+    'cv2',
+    
+    # Numpy/Scipy
+    'numpy',
+    'scipy',
+    'scipy.special',
+    
+    # YAML (used by PaddleX configs)
+    'yaml',
+    'ruamel',
+    'ruamel.yaml',
+    
+    # Requests (for model downloads)
+    'requests',
+    'urllib3',
     
     # App modules
     'app.core',
@@ -90,13 +148,14 @@ hiddenimports = [
 hiddenimports += collect_submodules('transformers')
 hiddenimports += collect_submodules('torch')
 hiddenimports += collect_submodules('PySide6')
+hiddenimports += collect_submodules('paddle')
+hiddenimports += collect_submodules('paddleocr')
+hiddenimports += collect_submodules('paddlex')
 
 # Exclude unnecessary modules to reduce size
 excludes = [
     'tkinter',
     'matplotlib',
-    'numpy.testing',
-    'scipy',
     'IPython',
     'jupyter',
     'notebook',
@@ -106,7 +165,7 @@ excludes = [
 a = Analysis(
     ['app/main_qt.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
