@@ -1,0 +1,128 @@
+# ===========================================
+# LAC Translate - Build & Release Workflow
+# Builds Windows executable on version tags only
+# ===========================================
+
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger ONLY on version tags like v1.0.0
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  PYTHON_VERSION: '3.11'
+  DISABLE_MODEL_SOURCE_CHECK: 'True'
+
+jobs:
+  # ===========================================
+  # Windows Build
+  # ===========================================
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Verify installations
+        run: |
+          python -c "import PySide6; print(f'PySide6: {PySide6.__version__}')"
+          python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+          python -c "import fitz; print(f'PyMuPDF: {fitz.version}')"
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller lac_translate.spec --clean --noconfirm
+
+      - name: Create launcher script
+        run: |
+          echo '@echo off' > "dist/lac-translate/Avvia LAC Translate.bat"
+          echo 'cd /d "%~dp0"' >> "dist/lac-translate/Avvia LAC Translate.bat"
+          echo 'start "" lac-translate.exe' >> "dist/lac-translate/Avvia LAC Translate.bat"
+
+      - name: Verify build
+        run: |
+          if (Test-Path "dist/lac-translate/lac-translate.exe") {
+            Write-Host "✅ Build successful!"
+            $size = (Get-ChildItem -Path "dist/lac-translate" -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+            Write-Host "📦 Total size: $([math]::Round($size, 2)) MB"
+          } else {
+            Write-Host "❌ Build failed - executable not found"
+            exit 1
+          }
+
+      - name: Create ZIP archive
+        run: |
+          Compress-Archive -Path "dist/lac-translate/*" -DestinationPath "lac-translate-windows.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lac-translate-windows
+          path: lac-translate-windows.zip
+          retention-days: 30
+
+  # ===========================================
+  # Create Release (only on tags)
+  # ===========================================
+  release:
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lac-translate-windows
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: LAC Translate ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## LAC Translate ${{ steps.version.outputs.VERSION }}
+            
+            Professional PDF Translator with NLLB-200 and PaddleOCR.
+            
+            ### Downloads
+            - **Windows**: `lac-translate-windows.zip` - Extract and run `lac-translate.exe`
+            
+            ### Requirements
+            - Windows 10/11
+            - 4GB+ RAM recommended
+            - Internet connection for first-time model download
+            
+            ### First Run
+            On first run, the application will download translation models (~1.5GB).
+            This is a one-time download.
+          files: |
+            lac-translate-windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

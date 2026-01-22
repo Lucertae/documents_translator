@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=LAC Translate
+Comment=Professional PDF Translation Application
+Exec=lac-translate
+Path=/home/bracco/lac-translate/dist/lac-translate
+Icon=/home/bracco/lac-translate/assets/icon.png
+Terminal=false
+Type=Application
+Categories=Office;Translation;
+StartupNotify=true
+StartupWMClass=lac-translate

@@ -1,99 +1,215 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file per LAC TRANSLATE
-Crea eseguibile standalone Windows
+LAC Translate - PyInstaller Build Specification (Windows & Linux)
 """
+
+import sys
+import os
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
 
 block_cipher = None
 
+# Collect all necessary data files
+datas = []
+
+# PySide6 resources
+datas += collect_data_files('PySide6', include_py_files=False)
+
+# Transformers models (NLLB) - Note: models are downloaded at runtime
+datas += collect_data_files('transformers', include_py_files=False)
+
+# SentencePiece
+datas += collect_data_files('sentencepiece', include_py_files=False)
+
+# PaddlePaddle - CRITICAL: include all data files and libs
+try:
+    datas += collect_data_files('paddle', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddle data files: {e}")
+
+# PaddleOCR resources
+try:
+    datas += collect_data_files('paddleocr', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddleocr data files: {e}")
+
+# PaddleX resources (required by PaddleOCR v3+)
+try:
+    datas += collect_data_files('paddlex', include_py_files=True)
+except Exception as e:
+    print(f"Warning: Could not collect paddlex data files: {e}")
+
+# Collect binaries/dynamic libraries
+binaries = []
+
+# PaddlePaddle dynamic libraries (critical for Windows)
+try:
+    binaries += collect_dynamic_libs('paddle')
+except Exception as e:
+    print(f"Warning: Could not collect paddle dynamic libs: {e}")
+
+try:
+    binaries += collect_dynamic_libs('paddleocr')
+except Exception as e:
+    print(f"Warning: Could not collect paddleocr dynamic libs: {e}")
+
+# Include app resources (with existence checks for CI compatibility)
+app_resources = [
+    ('app/deep_translator', 'app/deep_translator'),
+    ('logs/README.txt', 'logs'),
+    ('output/README.txt', 'output'),
+    ('assets/icon.png', 'assets'),
+]
+for src, dst in app_resources:
+    if os.path.exists(src):
+        datas.append((src, dst))
+
+# Hidden imports for dynamic loading
+hiddenimports = [
+    # PySide6
+    'PySide6.QtCore',
+    'PySide6.QtGui',
+    'PySide6.QtWidgets',
+    'PySide6.QtPrintSupport',
+    
+    # Transformers & ML
+    'transformers',
+    'transformers.models.nllb',
+    'transformers.models.m2m_100',
+    'sentencepiece',
+    'sacremoses',
+    'torch',
+    'torch.nn',
+    'torch.nn.functional',
+    
+    # PDF processing
+    'fitz',
+    'pymupdf',
+    
+    # Image processing
+    'PIL',
+    'PIL.Image',
+    'pdf2image',
+    
+    # PaddlePaddle - ALL required modules
+    'paddle',
+    'paddle.fluid',
+    'paddle.inference',
+    'paddle.base',
+    'paddle.framework',
+    'paddle.utils',
+    'paddle.device',
+    'paddle.nn',
+    'paddle.optimizer',
+    'paddle.io',
+    'paddle.vision',
+    'paddle.distributed',
+    
+    # PaddleOCR
+    'paddleocr',
+    'paddleocr.paddleocr',
+    
+    # PaddleX (required by PaddleOCR v3+)
+    'paddlex',
+    'paddlex.inference',
+    'paddlex.inference.pipelines',
+    'paddlex.inference.models',
+    'paddlex.modules',
+    
+    # OpenCV (used by PaddleOCR)
+    'cv2',
+    
+    # Numpy/Scipy
+    'numpy',
+    'scipy',
+    'scipy.special',
+    
+    # YAML (used by PaddleX configs)
+    'yaml',
+    'ruamel',
+    'ruamel.yaml',
+    
+    # Requests (for model downloads)
+    'requests',
+    'urllib3',
+    
+    # App modules
+    'app.core',
+    'app.core.pdf_processor',
+    'app.core.translator',
+    'app.ui',
+    'app.ui.main_window',
+    'app.ui.pdf_viewer',
+    'app.deep_translator',
+]
+
+# Collect all submodules for complex packages
+hiddenimports += collect_submodules('transformers')
+hiddenimports += collect_submodules('torch')
+hiddenimports += collect_submodules('PySide6')
+hiddenimports += collect_submodules('paddle')
+hiddenimports += collect_submodules('paddleocr')
+hiddenimports += collect_submodules('paddlex')
+
+# Exclude unnecessary modules to reduce size
+excludes = [
+    'tkinter',
+    'matplotlib',
+    'IPython',
+    'jupyter',
+    'notebook',
+    'pytest',
+]
+
 a = Analysis(
-    ['app/pdf_translator_gui.py'],
-    pathex=[],
-    binaries=[],
-    datas=[
-        ('app/deep_translator', 'deep_translator'),  # Include deep_translator module
-        ('security', 'security'),  # Include security module
-        ('resources/icons/logo_alt.ico', '.'),  # Include icon
-        ('security/file_manifest.json', 'security'),  # Include integrity manifest
-    ],
-    hiddenimports=[
-        'tkinter',
-        'tkinter.ttk',
-        'tkinter.filedialog',
-        'tkinter.messagebox',
-        'tkinter.scrolledtext',
-        'PIL',
-        'PIL.Image',
-        'PIL.ImageTk',
-        'pymupdf',
-        'fitz',
-        'argostranslate',
-        'argostranslate.package',
-        'argostranslate.translate',
-        'deep_translator',
-        'deep_translator.GoogleTranslator',
-        'ocr_manager',
-        'security',
-        'security.security_manager',
-        'security.__init__',
-        'cryptography',
-        'cryptography.fernet',
-        'license_manager',
-        'license_activation',
-        'license_tracker',
-        'settings_manager',
-        'settings_dialog',
-        'integrity_checker',
-        'security_validator',
-        'secure_storage',
-        'update_checker',
-        'update_downloader',
-        'batch_processor',
-        'batch_dialog',
-        'psutil',
-        'json',
-        'hashlib',
-        'base64',
-    ],
+    ['app/main_qt.py'],
+    pathex=['.'],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        'matplotlib',
-        'numpy',
-        'pandas',
-        'scipy',
-        'IPython',
-        'jupyter',
-    ],
+    excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
-    noarchive=False,  # Crea archivio - codice più difficile da estrarre
+    noarchive=False,
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Icona per Windows (se esiste)
+import os
+icon_path = 'assets/icon.ico' if os.path.exists('assets/icon.ico') else None
+
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
-    name='LAC_Translate',
-    debug=False,  # NO DEBUG - nasconde informazioni codice sorgente
+    exclude_binaries=True,
+    name='lac-translate',
+    debug=False,
     bootloader_ignore_signals=False,
-    strip=True,  # Rimuove simboli debug
-    upx=True,  # Compressione per nascondere codice
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,  # No console window (GUI only) - nasconde output debug
+    strip=False,
+    upx=True,
+    console=True,  # Abilitato per vedere errori di avvio - cambiare a False per release
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='resources/icons/logo_alt.ico',  # Application icon
+    icon=icon_path,  # Icona Windows (.ico)
 )
 
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='lac-translate',
+)

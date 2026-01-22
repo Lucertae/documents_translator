@@ -4,9 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
-venv/
-ENV/
 build/
 develop-eggs/
 dist/
@@ -23,37 +20,13 @@ wheels/
 .installed.cfg
 *.egg
 
-# LAC TRANSLATE specific
-config/settings.json
-config/update_config.json
-license/license.dat
-license/config.json
-license/eula_accepted.txt
-logs/*.log
-logs/*.txt
-output/*.pdf
-output/*.txt
-dev/*.log
-dev/status/*.txt
-dev/archive/
-application.log
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
 
-# License tracking and keys (CRITICAL - NEVER commit)
-license_tracking.db
-license_tracking.db-journal
-license_keys/
-license_registry.json
-*.db
-*.sqlite
-*.sqlite3
-
-# Build output
-build/
-dist/
-release/
-*.spec.bak
-
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
@@ -63,79 +36,22 @@ release/
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
+
+# Application specific
+logs/*.log
+output/*.pdf
+*.pdf
+!docs/**/*.pdf
 
 # Temporary files
 *.tmp
-*.temp
 *.bak
-*.backup
-*.old
-*.orig
-*.save
+*.cache
 
-# Certificates and private keys (CRITICAL - NEVER commit)
-*.pfx
-*.p12
-*.key
-*.pem
-*.crt
-*.cer
+# Tesseract data (too large for git)
+# tessdata/
 
-# Secrets and tokens
-.env
-.env.local
-.env.*.local
-*.secret
-secrets/
-.secrets/
-api_keys.txt
-tokens.txt
-credentials.json
+# Argos models (downloaded at runtime)
+# .local/share/argos-translate/
 
-# Downloads and updates
-downloads/
-updates/
-*.update
-
-# Generated PDFs (keep source .md files)
-docs/*.pdf
-guides/*.pdf
-
-# Commercial documents (NOT for public repository)
-docs/commercial/
-docs/internal/GITHUB_SETUP.md
-docs/internal/RIEPILOGO_IMPLEMENTAZIONE_VENDITA.md
-docs/internal/PREVENTIVI_E_PREZZISTICHE.md
-docs/internal/WHAT_GOES_ON_GITHUB.md
-docs/internal/LICENZA_GITHUB_STRATEGY.md
-
-# Version files (generated)
-VERSION.json
-# version.json can be committed for releases (uncomment if needed)
-# version.json
-
-# Security files (CRITICAL - NEVER commit)
-security/.encryption_key
-security/secure_storage.json
-security/security_config.json
-# security/file_manifest.json  # Can be committed for releases (integrity checking)
-logs/security.log
-
-# Lock files (optional - decide if needed for chandra/)
-*.lock
-# uv.lock  # Uncomment if NOT committing lock files for chandra/
-# poetry.lock
-
-# Test coverage
-.coverage
-.coverage.*
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Chandra and Dolphin cache
-chandra/**/__pycache__/
-chandra/.pytest_cache/
-Dolphin/**/__pycache__/
+output/
