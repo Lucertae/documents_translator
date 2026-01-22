@@ -1,17 +1,14 @@
 # ===========================================
 # LAC Translate - Build & Release Workflow
-# Builds Windows and Linux executables on push to main
+# Builds Windows executable on version tags only
 # ===========================================
 
 name: Build & Release
 
 on:
   push:
-    branches: [main]
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0
-  pull_request:
-    branches: [main]
+      - 'v*'  # Trigger ONLY on version tags like v1.0.0
   workflow_dispatch:  # Allow manual trigger
 
 env:
@@ -80,87 +77,10 @@ jobs:
           retention-days: 30
 
   # ===========================================
-  # Linux Build
-  # ===========================================
-  build-linux:
-    runs-on: ubuntu-22.04
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxcb-xinerama0 \
-            libxcb-cursor0 \
-            libxkbcommon-x11-0 \
-            libgl1-mesa-dev \
-            libegl1 \
-            poppler-utils
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Verify installations
-        run: |
-          python -c "import PySide6; print(f'PySide6: {PySide6.__version__}')"
-          python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-          python -c "import fitz; print(f'PyMuPDF: {fitz.version}')"
-
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller lac_translate.spec --clean --noconfirm
-
-      - name: Create run script
-        run: |
-          cat > dist/lac-translate/run.sh << 'EOF'
-          #!/bin/bash
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-          ./lac-translate "$@"
-          EOF
-          chmod +x dist/lac-translate/run.sh
-          chmod +x dist/lac-translate/lac-translate
-
-      - name: Verify build
-        run: |
-          if [ -f "dist/lac-translate/lac-translate" ]; then
-            echo "✅ Build successful!"
-            SIZE=$(du -sh dist/lac-translate | cut -f1)
-            echo "📦 Total size: $SIZE"
-          else
-            echo "❌ Build failed - executable not found"
-            exit 1
-          fi
-
-      - name: Create TAR.GZ archive
-        run: |
-          cd dist
-          tar -czvf ../lac-translate-linux.tar.gz lac-translate
-
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lac-translate-linux
-          path: lac-translate-linux.tar.gz
-          retention-days: 30
-
-  # ===========================================
   # Create Release (only on tags)
   # ===========================================
   release:
-    needs: [build-windows, build-linux]
+    needs: [build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     
@@ -175,11 +95,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: lac-translate-windows
-
-      - name: Download Linux artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: lac-translate-linux
 
       - name: Get version from tag
         id: version
@@ -196,10 +111,9 @@ jobs:
             
             ### Downloads
             - **Windows**: `lac-translate-windows.zip` - Extract and run `lac-translate.exe`
-            - **Linux**: `lac-translate-linux.tar.gz` - Extract and run `./lac-translate`
             
             ### Requirements
-            - Windows 10/11 or Linux (Ubuntu 20.04+)
+            - Windows 10/11
             - 4GB+ RAM recommended
             - Internet connection for first-time model download
             
@@ -208,7 +122,6 @@ jobs:
             This is a one-time download.
           files: |
             lac-translate-windows.zip
-            lac-translate-linux.tar.gz
           draft: false
           prerelease: false
         env:
