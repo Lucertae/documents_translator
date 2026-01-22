@@ -1190,6 +1190,9 @@ class PDFProcessor:
             # Insert translated text column by column
             total_inserted = 0
             
+            # Track current Y position per column to avoid overlaps
+            column_y_tracker = {}
+            
             for col_idx in sorted(column_content.keys()):
                 content = column_content[col_idx]
                 if not content:
@@ -1206,19 +1209,31 @@ class PDFProcessor:
                 if col_width < 50:
                     continue
                 
+                # Initialize Y tracker for this column
+                current_y = None
+                
                 # Insert each paragraph in column
                 for item in content:
-                    y_pos = item['y']
+                    original_y = item['y']
                     text = item['text']
                     height = item['height']
                     # Use full paragraph height if available
                     para_height = item.get('para_height', height * line_spacing)
                     
-                    font_size = max(7, min(height * 0.85, 12))
+                    # Prevent overlaps: use max of original position and current tracker
+                    if current_y is None:
+                        y_pos = original_y
+                    else:
+                        # Add small gap between blocks (3pt)
+                        y_pos = max(original_y, current_y + 3)
+                    
+                    # Font size: minimum 8pt for readability, max 12pt
+                    font_size = max(8, min(height * 0.85, 12))
                     
                     try:
-                        # Use paragraph height for text box to allow multi-line text
-                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + max(para_height, height * 2))
+                        # Calculate text box height
+                        box_height = max(para_height, height * 2)
+                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + box_height)
                         
                         excess = new_page.insert_textbox(
                             text_rect,
@@ -1231,15 +1246,19 @@ class PDFProcessor:
                         
                         if excess < 0:
                             # Text didn't fit, try smaller font and expand box
-                            expanded_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + para_height * 1.5)
+                            box_height = para_height * 1.5
+                            expanded_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + box_height)
                             new_page.insert_textbox(
                                 expanded_rect,
                                 text,
-                                fontsize=max(6, font_size * 0.75),
+                                fontsize=max(7, font_size * 0.8),  # Min 7pt fallback
                                 fontname="helv",
                                 color=text_color,
                                 align=0
                             )
+                        
+                        # Update Y tracker to end of this block
+                        current_y = y_pos + box_height
                         total_inserted += 1
                     except Exception as e:
                         logging.debug(f"Failed to insert paragraph: {e}")
