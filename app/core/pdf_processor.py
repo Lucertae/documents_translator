@@ -1392,6 +1392,11 @@ class PDFProcessor:
                     # First pass: collect sizes and origins to calculate line averages
                     span_data = []
                     for span in line["spans"]:
+                        # Always add span bbox to redaction list (even empty spans)
+                        span_bbox = span.get("bbox")
+                        if span_bbox:
+                            areas_to_redact.append(span_bbox)
+                        
                         text = span.get("text", "").strip()
                         if text:
                             bbox = span["bbox"]
@@ -1459,9 +1464,7 @@ class PDFProcessor:
                         )
                         lines_info.append(line_info)
                         
-                        # Collect ALL bboxes for redaction
-                        for bbox in line_bboxes:
-                            areas_to_redact.append(bbox)
+                        # Note: bboxes are already added to areas_to_redact in the span loop above
             
             if not lines_info:
                 continue
@@ -1521,7 +1524,8 @@ class PDFProcessor:
                             })
                             translated_count += 1
                     else:
-                        # Multi-line paragraph - translate together, then distribute
+                        # Multi-line paragraph - translate together and insert in UNIFIED bbox
+                        # This prevents overlapping text by using one merged bbox for the whole paragraph
                         para_text = " ".join(li.text for li in para_lines)
                         
                         try:
@@ -1544,28 +1548,59 @@ class PDFProcessor:
                                     translated_count += 1
                                 continue
                             
-                            # Distribute translated text across original lines
-                            translated_sentences = split_into_sentences(translated_para)
-                            original_line_lengths = [len(li.text) for li in para_lines]
-                            line_texts = align_sentences_to_lines(
-                                translated_sentences,
-                                len(para_lines),
-                                original_line_lengths
+                            # NEW APPROACH: Insert ALL translated text in ONE unified bbox
+                            # This prevents overlap caused by text wrapping into adjacent line bboxes
+                            
+                            # Create unified bbox covering all lines in this paragraph
+                            all_bboxes = [li.merged_bbox for li in para_lines]
+                            unified_bbox = self._merge_bboxes(all_bboxes)
+                            
+                            # If we're processing a single block, use the original block bbox
+                            # This ensures we have the full height including empty lines
+                            if len(block_group) == 1:
+                                original_block_bbox = block_group[0]['bbox']
+                                # Use original bbox if it's larger (includes empty lines)
+                                if original_block_bbox[3] - original_block_bbox[1] > unified_bbox[3] - unified_bbox[1]:
+                                    unified_bbox = (
+                                        unified_bbox[0],  # Keep calculated x0
+                                        original_block_bbox[1],  # Use original y0
+                                        unified_bbox[2],  # Keep calculated x1
+                                        original_block_bbox[3]   # Use original y1
+                                    )
+                            
+                            # IMPORTANT: Add ALL original line bboxes to redaction list
+                            # This ensures all original text is removed before inserting translation
+                            for li in para_lines:
+                                for span in li.spans:
+                                    areas_to_redact.append(span.bbox)
+                            
+                            # Use first line's formatting as the paragraph style
+                            first_line = para_lines[0]
+                            
+                            # Create a synthetic LineFormatInfo with unified bbox
+                            unified_line_info = LineFormatInfo(
+                                text=para_text,
+                                spans=first_line.spans,  # Use first line's formatting
+                                merged_bbox=unified_bbox,
+                                rotation=first_line.rotation,
+                                wmode=first_line.wmode
                             )
                             
-                            for line_info, line_text in zip(para_lines, line_texts):
-                                if line_text.strip():
-                                    formatted_text = self._apply_span_formatting(
-                                        line_info, line_text, use_original_color
-                                    )
-                                    translations_to_insert.append({
-                                        'line_info': line_info,
-                                        'line_data': line_info.to_legacy_dict(),
-                                        'text': line_text,
-                                        'formatted_html': formatted_text,
-                                        'use_html': line_info.has_mixed_formatting
-                                    })
-                                    translated_count += 1
+                            # Apply formatting to translated paragraph
+                            formatted_para = self._apply_span_formatting(
+                                first_line, translated_para, use_original_color
+                            )
+                            
+                            # Insert as single paragraph translation
+                            translations_to_insert.append({
+                                'line_info': unified_line_info,
+                                'line_data': unified_line_info.to_legacy_dict(),
+                                'text': translated_para,
+                                'formatted_html': formatted_para,
+                                'use_html': first_line.has_mixed_formatting,
+                                'is_paragraph': True  # Mark as unified paragraph
+                            })
+                            translated_count += 1  # Count as one translated unit
                         
                         except Exception as e:
                             logging.error(f"Paragraph translation error: {e}")
@@ -1804,6 +1839,10 @@ class PDFProcessor:
         # Calculate optimal font size
         target_font_size = line_info.avg_size
         
+        # Ensure minimum font size of 7pt for readability
+        if target_font_size < 7:
+            target_font_size = 7
+        
         # Determine font family based on original
         if preserve_font_style:
             if line_info.is_monospace:
@@ -1837,6 +1876,19 @@ class PDFProcessor:
             # Allow wrapping for long text rather than shrinking
             needs_wrapping = True
         
+        # Expand bbox height if text needs wrapping (Italian ~15-20% longer than English)
+        if needs_wrapping:
+            estimated_lines = max(1, estimated_width / bbox_width)
+            line_height = target_font_size * 1.2  # slightly more than CSS line-height for safety
+            required_height = estimated_lines * line_height
+            if required_height > bbox_height:
+                # Expand bbox downward to fit wrapped text
+                # Use 30% buffer and allow up to 3x height for very long translations
+                expanded_height = min(required_height * 1.3, bbox_height * 3.0)
+                merged_bbox = (merged_bbox[0], merged_bbox[1], merged_bbox[2], merged_bbox[1] + expanded_height)
+                bbox_height = expanded_height
+                logging.debug(f"Expanded bbox height: {required_height:.1f} -> {expanded_height:.1f}pt")
+        
         # Get rotation from line_info
         rotation = line_info.rotation
         
@@ -1860,7 +1912,7 @@ class PDFProcessor:
             color: {css_color};
             font-weight: {base_weight};
             font-style: {base_style};
-            line-height: 1.15;
+            line-height: 1.3;
             padding: 0;
             margin: 0;
             white-space: {white_space};
@@ -1876,13 +1928,28 @@ class PDFProcessor:
         """
         
         try:
-            page.insert_htmlbox(merged_bbox, formatted_html, css=css, rotate=rotation)
-            logging.debug(f"✓ Formatted HTML insertion successful (rotation={rotation}°)")
+            # Determine scale_low based on content type
+            # Footnotes (small font or bottom of page) need more aggressive scaling
+            page_height = page.rect.height
+            is_footnote = target_font_size < 11 or merged_bbox[1] > page_height * 0.7
+            
+            if is_footnote:
+                # Footnotes: allow up to 50% shrinking for dense text
+                scale_low = 0.5
+            else:
+                # Normal text: allow up to 40% shrinking
+                scale_low = 0.6
+            
+            result = page.insert_htmlbox(merged_bbox, formatted_html, css=css, rotate=rotation, scale_low=scale_low)
+            if result[0] < 0:
+                # spare_height=-1 means text didn't fit even with shrinking
+                logging.warning(f"Text didn't fit in bbox {merged_bbox}, scale={result[1]:.2f}")
+            logging.debug(f"✓ Formatted HTML insertion successful (rotation={rotation}°, scale={result[1]:.2f})")
         except Exception as e:
             logging.warning(f"Formatted HTML insertion failed: {e}, falling back to plain text")
             # Fallback to plain text without formatting
             try:
-                page.insert_htmlbox(merged_bbox, plain_text, css=css, rotate=rotation)
+                page.insert_htmlbox(merged_bbox, plain_text, css=css, rotate=rotation, scale_low=0.5)
             except Exception as e2:
                 logging.error(f"Plain text fallback also failed: {e2}")
     
@@ -1927,8 +1994,19 @@ class PDFProcessor:
             should_break = False
             break_reason = ""
             
+            # Check vertical gap first - this is the most reliable indicator
+            prev_bottom = prev_line.merged_bbox[3]  # y1
+            curr_top = curr_line.merged_bbox[1]     # y0
+            gap = curr_top - prev_bottom
+            avg_height = (prev_line.avg_size + curr_line.avg_size) / 2
+            
+            # Large gap (> 1.5x font size) always indicates paragraph break
+            has_large_gap = gap > avg_height * 1.5
+            
             # Check 1: Previous line ends with sentence-ending punctuation
+            # BUT only break if there's also a noticeable gap or style change
             prev_text = prev_line.text.strip()
+            ends_with_punct = False
             if prev_text and prev_text[-1] in '.!?:':
                 # Check it's not an abbreviation (single letter before period)
                 words = prev_text.split()
@@ -1936,8 +2014,12 @@ class PDFProcessor:
                     last_word = words[-1].rstrip('.!?:')
                     # Not an abbreviation if word is long or all caps
                     if len(last_word) > 2 or last_word.isupper():
-                        should_break = True
-                        break_reason = "sentence_end"
+                        ends_with_punct = True
+            
+            # Only break on punctuation if there's also a gap (moderate, not large)
+            if ends_with_punct and gap > avg_height * 0.8:
+                should_break = True
+                break_reason = "sentence_end_with_gap"
             
             # Check 2: Significant font size change (likely heading)
             if not should_break:
@@ -1966,17 +2048,10 @@ class PDFProcessor:
                         should_break = True
                         break_reason = "title_pattern"
             
-            # Check 5: Vertical gap between lines
-            if not should_break:
-                prev_bottom = prev_line.merged_bbox[3]  # y1
-                curr_top = curr_line.merged_bbox[1]     # y0
-                gap = curr_top - prev_bottom
-                avg_height = (prev_line.avg_size + curr_line.avg_size) / 2
-                
-                # Gap larger than 1.5x the average font size suggests paragraph break
-                if gap > avg_height * 1.5:
-                    should_break = True
-                    break_reason = f"vertical_gap ({gap:.1f} > {avg_height * 1.5:.1f})"
+            # Check 5: Large vertical gap between lines (already calculated)
+            if not should_break and has_large_gap:
+                should_break = True
+                break_reason = f"vertical_gap ({gap:.1f} > {avg_height * 1.5:.1f})"
             
             if should_break:
                 logging.debug(f"Paragraph break before line '{curr_line.text[:30]}...' reason: {break_reason}")
@@ -2077,6 +2152,24 @@ class PDFProcessor:
                     if len(last_word) > 3 or (last_word.isupper() and len(last_word) > 1):
                         should_merge = False
             
+            # Check 1b: Previous block is short metadata (date, version, etc.)
+            # These standalone lines should NOT merge with body text
+            if should_merge:
+                prev_lower = prev_text.lower()
+                # Pattern: short line with date/version indicators
+                metadata_patterns = [
+                    'draft:', 'first draft', 'version:', 'date:', 'revised:',
+                    'bozza:', 'prima bozza', 'versione:', 'data:', 'revisionato:'
+                ]
+                is_metadata = any(pat in prev_lower for pat in metadata_patterns)
+                # Also catch lines ending with a year (e.g., "April 11, 2015")
+                if not is_metadata and len(prev_text) < 60:
+                    import re
+                    if re.search(r'\b(19|20)\d{2}\b\s*$', prev_text):
+                        is_metadata = True
+                if is_metadata and len(prev_text) < 60:
+                    should_merge = False
+            
             # Check 2: Font size change (likely heading)
             if should_merge:
                 size_ratio = curr['font_size'] / prev['font_size'] if prev['font_size'] > 0 else 1
@@ -2097,6 +2190,15 @@ class PDFProcessor:
                         if curr_text.istitle() or curr_text.isupper():
                             should_merge = False
             
+            # Check 4b: Footnote pattern - current text starts with number
+            # (e.g., "3 Rakoff 1983" or "2 Throughout...")
+            if should_merge:
+                import re
+                curr_text = curr['text'].strip()
+                if re.match(r'^\d+\s', curr_text):
+                    # Looks like a footnote, don't merge
+                    should_merge = False
+            
             # Check 5: Significant vertical gap between blocks
             if should_merge:
                 prev_bottom = prev['bbox'][3]  # y1
@@ -2107,6 +2209,30 @@ class PDFProcessor:
                 # Gap larger than 2x font size suggests paragraph break
                 if gap > avg_font_size * 2:
                     should_merge = False
+            
+            # Check 6: COLUMN DETECTION - blocks must have X overlap to merge
+            # This prevents merging blocks from different columns
+            if should_merge:
+                prev_x0, prev_x1 = prev['bbox'][0], prev['bbox'][2]
+                curr_x0, curr_x1 = curr['bbox'][0], curr['bbox'][2]
+                
+                # Calculate horizontal overlap
+                overlap_start = max(prev_x0, curr_x0)
+                overlap_end = min(prev_x1, curr_x1)
+                overlap = max(0, overlap_end - overlap_start)
+                
+                # Calculate widths
+                prev_width = prev_x1 - prev_x0
+                curr_width = curr_x1 - curr_x0
+                min_width = min(prev_width, curr_width) if min(prev_width, curr_width) > 0 else 1
+                
+                # Require at least 30% overlap of the narrower block
+                # This allows for slight indentation but catches different columns
+                overlap_ratio = overlap / min_width
+                
+                if overlap_ratio < 0.30:
+                    should_merge = False
+                    logging.debug(f"Column break detected: overlap {overlap_ratio:.1%} between '{prev['text'][:20]}...' and '{curr['text'][:20]}...'")
             
             if should_merge:
                 current_group.append(curr)
