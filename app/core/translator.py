@@ -10,6 +10,8 @@ from typing import Optional, Dict, List, Tuple
 from transformers import MarianMTModel, MarianTokenizer
 import torch
 
+from .sentry_integration import capture_exception, add_breadcrumb
+
 
 def split_into_sentences(text: str) -> List[str]:
     """
@@ -311,6 +313,12 @@ class TranslationEngine:
             logging.info(f"[OK] OPUS-MT model loaded: {source_lang} → {target_lang}")
             
         except Exception as e:
+            capture_exception(e, context={
+                "operation": "load_opus_model",
+                "model_name": model_name,
+                "source_lang": source_lang,
+                "target_lang": target_lang,
+            }, tags={"component": "translator"})
             logging.error(f"Failed to load OPUS-MT model: {e}")
             raise
     
@@ -488,6 +496,12 @@ class TranslationEngine:
             return translation
             
         except Exception as e:
+            capture_exception(e, context={
+                "operation": "translate",
+                "text_length": len(text) if text else 0,
+                "source_lang": self.source_lang,
+                "target_lang": self.target_lang,
+            }, tags={"component": "translator"})
             logging.error(f"OPUS-MT translation failed: {e}")
             return text
     

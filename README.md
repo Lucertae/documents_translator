@@ -243,6 +243,157 @@ Vedere [QUALITY_REPORT.md](QUALITY_REPORT.md) per analisi dettagliata.
 
 ---
 
-## 📜 Licenza
+## � Error Tracking con Sentry
+
+LAC Translate utilizza **Sentry** per il monitoraggio degli errori in produzione.
+
+### Configurazione
+
+1. Crea un progetto su [sentry.io](https://sentry.io)
+2. Copia il DSN del progetto
+3. Crea un file `.env` nella root del progetto:
+
+```bash
+# .env
+SENTRY_DSN=https://your-dsn@sentry.io/project-id
+SENTRY_ENVIRONMENT=development  # oppure: production, staging
+```
+
+### Cosa viene tracciato
+
+| Evento | Categoria | Dettagli |
+|--------|-----------|----------|
+| Errori PDF | `pdf` | Caricamento, estrazione testo, salvataggio |
+| Errori Traduzione | `translation` | Modello, encoding, timeout |
+| Errori OCR | `ocr` | PaddleOCR, layout detection |
+| Errori UI | `ui` | Worker threads, callbacks Qt |
+
+### Informazioni inviate
+
+Ogni errore include automaticamente:
+- **Versione app**: `lac-translate@0.1.3` (release tag)
+- **Tag versione**: `app.version.major`, `app.version.minor`, `app.version.patch`
+- **Sistema**: OS, versione Python, disponibilità CUDA
+- **Breadcrumbs**: Trail di azioni prima dell'errore
+- **Stack trace**: Completo con variabili locali
+
+### Privacy
+
+Il flag `send_default_pii=True` è abilitato. Per disabilitarlo, modifica in `sentry_integration.py`:
+
+```python
+init_sentry(send_default_pii=False)
+```
+
+---
+
+## 🏷️ Versioning e Release
+
+### Schema Versione
+
+Il progetto segue [Semantic Versioning](https://semver.org/):
+
+```
+MAJOR.MINOR.PATCH[-BUILD]
+  │     │     │      │
+  │     │     │      └── Build number (da GitHub Actions)
+  │     │     └── Bug fix, patch di sicurezza
+  │     └── Nuove feature retrocompatibili
+  └── Breaking changes
+```
+
+**Versione corrente**: `0.1.3`
+
+### File di Versione
+
+La versione è centralizzata in `app/__version__.py`:
+
+```python
+VERSION_MAJOR = 0
+VERSION_MINOR = 1
+VERSION_PATCH = 3
+VERSION_BUILD = ""  # Popolato da GitHub Actions
+
+__version__ = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
+APP_NAME = "lac-translate"
+```
+
+### Build con GitHub Actions
+
+Le build automatiche popolano il numero di build:
+
+```yaml
+# .github/workflows/build.yml
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Set version build number
+        run: |
+          # Inserisce build number nel file versione
+          BUILD_NUM="${{ github.run_number }}"
+          sed -i "s/VERSION_BUILD = \"\"/VERSION_BUILD = \"$BUILD_NUM\"/" app/__version__.py
+      
+      - name: Build executable
+        run: |
+          pyinstaller lac_translate.spec
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lac-translate-${{ matrix.os }}
+          path: dist/
+```
+
+### Creare una Release
+
+```bash
+# 1. Aggiorna versione in app/__version__.py
+# 2. Commit e tag
+git add app/__version__.py
+git commit -m "Bump version to 0.2.0"
+git tag v0.2.0
+git push origin main --tags
+
+# GitHub Actions builderà automaticamente per Linux e Windows
+```
+
+### Visualizzare Versione
+
+```bash
+# Da Python
+python -c "from app.__version__ import get_version_with_build; print(get_version_with_build())"
+# Output: 0.1.3+42 (dove 42 è il build number)
+
+# In Sentry, vedrai: lac-translate@0.1.3+42
+```
+
+---
+
+## �📜 Licenza
 
 Apache 2.0 - Basato su pdf-translator-for-human
