@@ -16,6 +16,14 @@ from pathlib import Path
 
 from .pdf_viewer import PDFViewerWidget
 from ..core import TranslationEngine, PDFProcessor
+from ..core.sentry_integration import (
+    capture_exception,
+    add_breadcrumb,
+    track_pdf_operation,
+    track_translation,
+    track_ui_action,
+    set_context,
+)
 
 
 class TranslationWorker(QThread):
@@ -41,6 +49,12 @@ class TranslationWorker(QThread):
             )
             self.finished.emit(translated_doc)
         except Exception as e:
+            # Report to Sentry with context
+            capture_exception(e, context={
+                "operation": "translate_page",
+                "page_num": self.page_num,
+                "use_original_color": self.use_original_color,
+            })
             self.error.emit(str(e))
 
 
@@ -110,6 +124,12 @@ class BatchTranslationWorker(QThread):
                 self.all_finished.emit(self.pages_translated)
                 
         except Exception as e:
+            # Report to Sentry with context
+            capture_exception(e, context={
+                "operation": "batch_translation",
+                "pages_translated": self.pages_translated,
+                "total_pages": total_pages if 'total_pages' in dir() else 0,
+            })
             self.error.emit(str(e))
             logging.error(f"Batch translation error: {e}", exc_info=True)
 
@@ -968,6 +988,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def open_pdf(self):
         """Open PDF file dialog."""
+        track_ui_action("open_pdf_dialog")
+        
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open PDF Document",
@@ -1004,9 +1026,21 @@ class MainWindow(QMainWindow):
                 f"Loaded document • {self.pdf_processor.page_count} pages"
             )
             
+            # Track successful PDF open
+            track_pdf_operation("open", file_path, page_count=self.pdf_processor.page_count)
+            set_context("current_document", {
+                "filename": filename,
+                "page_count": self.pdf_processor.page_count,
+            })
+            
             logging.info(f"Opened PDF: {file_path}")
             
         except Exception as e:
+            # Report to Sentry
+            capture_exception(e, context={
+                "operation": "open_pdf",
+                "file_path": file_path,
+            })
             QMessageBox.critical(
                 self,
                 "Error",
@@ -1084,6 +1118,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "In Progress", "Translation already in progress")
             return
         
+        # Track translation start
+        track_translation(
+            self.translator.source_lang,
+            self.translator.target_lang,
+            self.current_page
+        )
+        
         self.progress_container.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.progress_label.setText(f"Translating page {self.current_page + 1}...")
@@ -1111,6 +1152,13 @@ class MainWindow(QMainWindow):
         )
         self.btn_save.setEnabled(True)
         
+        # Track successful translation
+        add_breadcrumb(
+            f"Page {self.current_page + 1} translated successfully",
+            category="translation",
+            level="info"
+        )
+        
         logging.info(f"Page {self.current_page + 1} translated successfully")
     
     @Slot(str)
@@ -1118,6 +1166,13 @@ class MainWindow(QMainWindow):
         """Handle translation error."""
         self.progress_container.setVisible(False)
         self.status_bar.showMessage("Translation failed")
+        
+        # Error already captured in worker, just add breadcrumb
+        add_breadcrumb(
+            f"Translation failed: {error_msg[:100]}",
+            category="translation",
+            level="error"
+        )
         
         QMessageBox.critical(
             self,
@@ -1317,6 +1372,8 @@ class MainWindow(QMainWindow):
             )
             return
         
+        track_ui_action("save_pdf_dialog")
+        
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Translated PDF",
@@ -1343,6 +1400,9 @@ class MainWindow(QMainWindow):
             )
             output_doc.close()
             
+            # Track successful save
+            track_pdf_operation("save", file_path, pages_saved=len(self.translated_pages))
+            
             self.status_bar.showMessage(f"Saved: {Path(file_path).name}", 5000)
             QMessageBox.information(
                 self,
@@ -1353,6 +1413,11 @@ class MainWindow(QMainWindow):
             logging.info(f"Saved translated PDF: {file_path}")
             
         except Exception as e:
+            # Report to Sentry
+            capture_exception(e, context={
+                "operation": "save_pdf",
+                "pages_count": len(self.translated_pages),
+            })
             QMessageBox.critical(
                 self,
                 "Export Error",

@@ -55,6 +55,9 @@ from .format_utils import (
 # Import OCR post-processing
 from .ocr_utils import clean_ocr_text, post_process_ocr_text
 
+# Import Sentry integration
+from .sentry_integration import capture_exception, add_breadcrumb, set_context
+
 
 # NOTE: SpanFormat and LineFormatInfo classes moved to formatting.py
 # NOTE: map_formatting_to_translation and helpers moved to format_utils.py
@@ -137,6 +140,10 @@ class PDFProcessor:
             self.page_count = self.document.page_count
             logging.info(f"PDF loaded: {self.pdf_path} ({self.page_count} pages)")
         except Exception as e:
+            capture_exception(e, context={
+                "operation": "load_pdf",
+                "pdf_path": self.pdf_path,
+            }, tags={"component": "pdf_processor"})
             logging.error(f"Failed to load PDF: {e}")
             raise
     
@@ -422,6 +429,11 @@ class PDFProcessor:
                 logging.info(f"[OK] PaddleOCR PP-OCRv5 initialized for {language}")
             except Exception as e:
                 error_msg = str(e)
+                capture_exception(e, context={
+                    "operation": "init_paddleocr",
+                    "language": language,
+                    "error_type": "dependency" if "dependency" in error_msg.lower() else "other",
+                }, tags={"component": "ocr"})
                 logging.error(f"Failed to initialize PaddleOCR: {error_msg}")
                 if "dependency error" in error_msg.lower() or "predictor creation" in error_msg.lower():
                     logging.error("=" * 60)
@@ -450,6 +462,7 @@ class PDFProcessor:
             except Exception as e:
                 error_msg = str(e)
                 if "dependency error" not in error_msg.lower():
+                    capture_exception(e, context={"operation": "init_layout_detection"}, tags={"component": "ocr"})
                     logging.error(f"Failed to initialize LayoutDetection: {e}")
                 cls._layout_engine = None
                 cls._layout_engine = None
@@ -466,6 +479,7 @@ class PDFProcessor:
                 cls._doc_preprocessor = DocPreprocessor()
                 logging.info("[OK] DocPreprocessor initialized")
             except Exception as e:
+                capture_exception(e, context={"operation": "init_doc_preprocessor"}, tags={"component": "ocr"})
                 logging.error(f"Failed to initialize DocPreprocessor: {e}")
                 cls._doc_preprocessor = None
         return cls._doc_preprocessor
@@ -481,6 +495,7 @@ class PDFProcessor:
                 cls._pp_structure = PPStructureV3()
                 logging.info("[OK] PPStructureV3 initialized")
             except Exception as e:
+                capture_exception(e, context={"operation": "init_pp_structure"}, tags={"component": "ocr"})
                 logging.error(f"Failed to initialize PPStructureV3: {e}")
                 cls._pp_structure = None
         return cls._pp_structure
@@ -574,6 +589,7 @@ class PDFProcessor:
             logging.warning("PaddleOCR returned no results")
             
         except Exception as e:
+            capture_exception(e, context={"operation": "ocr_extract"}, tags={"component": "ocr"})
             logging.warning(f"PaddleOCR failed: {e}")
         return ""
     
@@ -1282,6 +1298,10 @@ class PDFProcessor:
             return new_doc
             
         except Exception as e:
+            capture_exception(e, context={
+                "operation": "translate_ocr_page",
+                "page_num": page_num,
+            }, tags={"component": "pdf_processor"})
             logging.error(f"Page {page_num + 1}: OCR translation failed: {e}", exc_info=True)
             return new_doc
 
@@ -1529,6 +1549,7 @@ class PDFProcessor:
                             })
                             translated_count += 1
                         except Exception as e:
+                            capture_exception(e, context={"operation": "translate_line"}, tags={"component": "pdf_processor"})
                             logging.error(f"Line translation error: {e}")
                             translations_to_insert.append({
                                 'line_info': line_info,
@@ -1618,6 +1639,7 @@ class PDFProcessor:
                             translated_count += 1  # Count as one translated unit
                         
                         except Exception as e:
+                            capture_exception(e, context={"operation": "translate_paragraph"}, tags={"component": "pdf_processor"})
                             logging.error(f"Paragraph translation error: {e}")
                             # Fallback: translate each line separately
                             for line_info in para_lines:
@@ -1695,6 +1717,7 @@ class PDFProcessor:
                             translated_count += 1
                     
                 except Exception as e:
+                    capture_exception(e, context={"operation": "translate_block"}, tags={"component": "pdf_processor"})
                     logging.error(f"Block translation error: {e}, using line-by-line fallback")
                     for line_info in lines_info:
                         try:
@@ -1711,6 +1734,7 @@ class PDFProcessor:
                             })
                             translated_count += 1
                         except Exception as line_error:
+                            capture_exception(line_error, context={"operation": "translate_line_fallback"}, tags={"component": "pdf_processor"})
                             logging.error(f"Line translation failed: {line_error}")
         
         # ============================================
@@ -1759,6 +1783,7 @@ class PDFProcessor:
                         skip_clearing=True  # Already cleared via redaction
                     )
             except Exception as e:
+                capture_exception(e, context={"operation": "insert_translation"}, tags={"component": "pdf_processor"})
                 logging.error(f"Failed to insert translation: {e}")
         
         logging.info(f"Page {page_num + 1}: Successfully processed {total_blocks} blocks, translated {translated_count} lines")
@@ -1966,6 +1991,7 @@ class PDFProcessor:
             try:
                 page.insert_htmlbox(merged_bbox, plain_text, css=css, rotate=rotation, scale_low=0.5)
             except Exception as e2:
+                capture_exception(e2, context={"operation": "insert_plain_fallback"}, tags={"component": "pdf_processor"})
                 logging.error(f"Plain text fallback also failed: {e2}")
     
     def _group_lines_into_paragraphs(
@@ -2543,6 +2569,7 @@ class PDFProcessor:
                 )
                 logging.debug(f"[OK] Truncated text insertion successful (rotation={rotation}°)")
             except Exception as final_error:
+                capture_exception(final_error, context={"operation": "insert_text_final"}, tags={"component": "pdf_processor"})
                 logging.error(f"All insertion methods failed: {final_error}")
     
     def close(self) -> None:
