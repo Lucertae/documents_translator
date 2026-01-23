@@ -21,7 +21,6 @@ from ..core.sentry_integration import (
     add_breadcrumb,
     track_pdf_operation,
     track_translation,
-    track_ui_action,
     set_context,
 )
 
@@ -988,7 +987,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def open_pdf(self):
         """Open PDF file dialog."""
-        track_ui_action("open_pdf_dialog")
+        add_breadcrumb("Opening PDF dialog", category="ui", level="info")
         
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1372,7 +1371,7 @@ class MainWindow(QMainWindow):
             )
             return
         
-        track_ui_action("save_pdf_dialog")
+        add_breadcrumb("Saving PDF dialog", category="ui", level="info")
         
         file_path, _ = QFileDialog.getSaveFileName(
             self,
