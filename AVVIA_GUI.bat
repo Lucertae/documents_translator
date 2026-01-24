@@ -8,8 +8,8 @@ echo.
 echo Avvio interfaccia grafica...
 echo.
 
-cd /d "%~dp0\app"
-python pdf_translator_gui.py
+cd /d "%~dp0"
+python -m app.main_qt
 
 if errorlevel 1 (
     echo.
@@ -17,7 +17,7 @@ if errorlevel 1 (
     echo.
     echo Verifica:
     echo - Python installato
-    echo - Dipendenze installate: pip install -r ../requirements.txt
+    echo - Dipendenze installate: pip install -r requirements.txt
     echo.
 )
 

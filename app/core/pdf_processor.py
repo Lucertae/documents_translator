@@ -187,7 +187,7 @@ class PDFProcessor:
                     # Large image = covers more than 50% of page
                     if img_area > page_area * 0.5:
                         large_images += 1
-            except:
+            except Exception:
                 continue
         
         image_coverage = total_image_area / page_area if page_area > 0 else 0
@@ -1656,7 +1656,7 @@ class PDFProcessor:
                                         'use_html': line_info.has_mixed_formatting
                                     })
                                     translated_count += 1
-                                except:
+                                except Exception:
                                     translations_to_insert.append({
                                         'line_info': line_info,
                                         'line_data': line_info.to_legacy_dict(),
@@ -2399,7 +2399,7 @@ class PDFProcessor:
             for bbox in line_data['bboxes']:
                 try:
                     page.draw_rect(bbox, color=None, fill=WHITE)
-                except:
+                except Exception:
                     pass
         
         merged_bbox = line_data['merged_bbox']

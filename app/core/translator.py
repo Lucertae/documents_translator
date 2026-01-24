@@ -261,7 +261,10 @@ class TranslationEngine:
     }
     
     # Cache for loaded models (singleton per language pair)
+    # Max 4 models to limit memory usage (~1.2GB for 4 models)
     _model_cache: Dict[tuple, tuple] = {}
+    _model_cache_order: list = []  # Track insertion order for LRU eviction
+    _MAX_CACHED_MODELS = 4
     _device = None
     
     def __init__(self, source_lang: str = "en", target_lang: str = "it"):
@@ -283,13 +286,25 @@ class TranslationEngine:
         
     @classmethod
     def _load_model(cls, source_lang: str, target_lang: str):
-        """Load OPUS-MT model for specific language pair (lazy initialization with caching)."""
+        """Load OPUS-MT model for specific language pair (lazy initialization with LRU caching)."""
         lang_pair = (source_lang, target_lang)
         
-        # Return cached model if available
+        # Return cached model if available (and move to end for LRU)
         if lang_pair in cls._model_cache:
             logging.debug(f"Using cached OPUS-MT model: {source_lang} → {target_lang}")
+            # Move to end of order (most recently used)
+            if lang_pair in cls._model_cache_order:
+                cls._model_cache_order.remove(lang_pair)
+            cls._model_cache_order.append(lang_pair)
             return
+        
+        # Evict oldest model if cache is full
+        while len(cls._model_cache) >= cls._MAX_CACHED_MODELS:
+            if cls._model_cache_order:
+                oldest = cls._model_cache_order.pop(0)
+                if oldest in cls._model_cache:
+                    del cls._model_cache[oldest]
+                    logging.info(f"Evicted cached model: {oldest[0]} → {oldest[1]}")
         
         # Get model name for this language pair
         model_name = cls.OPUS_MODEL_MAP.get(lang_pair)
@@ -307,10 +322,11 @@ class TranslationEngine:
             model.to(cls._device)
             model.eval()
             
-            # Cache the model
+            # Cache the model and track order
             cls._model_cache[lang_pair] = (model, tokenizer)
+            cls._model_cache_order.append(lang_pair)
             
-            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} → {target_lang}")
+            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} → {target_lang} (cache: {len(cls._model_cache)}/{cls._MAX_CACHED_MODELS})")
             
         except Exception as e:
             capture_exception(e, context={
@@ -321,6 +337,22 @@ class TranslationEngine:
             }, tags={"component": "translator"})
             logging.error(f"Failed to load OPUS-MT model: {e}")
             raise
+    
+    @classmethod
+    def clear_cache(cls):
+        """Clear all cached models to free memory."""
+        cls._model_cache.clear()
+        cls._model_cache_order.clear()
+        logging.info("Translation model cache cleared")
+    
+    @classmethod
+    def get_cache_info(cls) -> dict:
+        """Get information about cached models."""
+        return {
+            "cached_models": list(cls._model_cache.keys()),
+            "count": len(cls._model_cache),
+            "max_size": cls._MAX_CACHED_MODELS,
+        }
     
     def _get_model(self):
         """Get the model and tokenizer for current language pair."""

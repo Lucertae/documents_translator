@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot, QPropertyAnimation, QEasin
 from PySide6.QtGui import QAction, QKeySequence, QFont, QColor, QPainter, QLinearGradient, QPainterPath, QIcon, QPen
 import logging
 from pathlib import Path
+import pymupdf
 
 from .pdf_viewer import PDFViewerWidget
 from ..core import TranslationEngine, PDFProcessor
@@ -1290,7 +1291,6 @@ class MainWindow(QMainWindow):
         if pdf_bytes:
             try:
                 # Deserialize PDF bytes back to document
-                import pymupdf
                 translated_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
                 self.translated_pages[page_num] = translated_doc
                 logging.info(f"Batch: Page {page_num + 1} translated and stored (total: {len(self.translated_pages)})")
@@ -1392,7 +1392,6 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            import pymupdf
             output_doc = pymupdf.open()
             
             for page_num in sorted(self.translated_pages.keys()):

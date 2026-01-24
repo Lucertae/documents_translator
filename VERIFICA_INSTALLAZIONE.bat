@@ -50,8 +50,8 @@ if errorlevel 1 echo ✗ Modelli Argos non installati
 echo.
 
 echo [5/6] Verifica file applicazione...
-if exist "app\pdf_translator_gui.py" (
-    echo ✓ GUI principale presente
+if exist "app\main_qt.py" (
+    echo ✓ GUI principale presente (Qt)
 ) else (
     echo ✗ GUI principale mancante
 )
