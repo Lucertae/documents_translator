@@ -125,7 +125,7 @@ class BatchTranslationWorker(QThread):
             capture_exception(e, context={
                 "operation": "batch_translation",
                 "pages_translated": self.pages_translated,
-                "total_pages": total_pages if 'total_pages' in dir() else 0,
+                "total_pages": total_pages if 'total_pages' in locals() else 0,
             })
             self.error.emit(str(e))
             logging.error(f"Batch translation error: {e}", exc_info=True)
@@ -1436,6 +1436,3 @@ class MainWindow(QMainWindow):
                 f"Failed to save PDF:\n{str(e)}"
             )
             logging.error(f"Failed to save PDF: {e}")
-
-
-import pymupdf
