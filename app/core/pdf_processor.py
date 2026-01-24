@@ -2301,70 +2301,6 @@ class PDFProcessor:
         
         return (x0, y0, x1, y1)
     
-    def _normalize_text_for_pdf(self, text: str) -> str:
-        """
-        Normalize text for proper PDF rendering.
-        
-        Handles:
-        - Unicode ligatures (fi, fl, ff, ffi, ffl) → individual chars
-        - Typographic quotes → standard quotes
-        - Special dashes → standard dashes
-        - Other problematic Unicode characters
-        
-        Note: Some ligatures may still be created by the PDF renderer
-        when using insert_htmlbox. This is generally acceptable as they
-        display correctly in most PDF viewers.
-        """
-        if not text:
-            return text
-        
-        # Ligature replacements (these cause rendering issues in base PDF fonts)
-        ligature_map = {
-            '\ufb00': 'ff',   # ff ligature
-            '\ufb01': 'fi',   # fi ligature
-            '\ufb02': 'fl',   # fl ligature
-            '\ufb03': 'ffi',  # ffi ligature
-            '\ufb04': 'ffl',  # ffl ligature
-            '\ufb05': 'ft',   # ft ligature (rare)
-            '\ufb06': 'st',   # st ligature (rare)
-        }
-        
-        # Typographic quotes → standard (optional - keeps readability)
-        quote_map = {
-            '\u201c': '"',    # Left double quotation mark "
-            '\u201d': '"',    # Right double quotation mark "
-            '\u2018': "'",    # Left single quotation mark '
-            '\u2019': "'",    # Right single quotation mark ' (also apostrophe)
-            '\u00ab': '"',    # Left guillemet «
-            '\u00bb': '"',    # Right guillemet »
-            '\u201e': '"',    # Double low quotation mark „
-            '\u201a': "'",    # Single low quotation mark ‚
-        }
-        
-        # Dashes and spaces
-        dash_map = {
-            '\u2013': '-',    # En-dash –
-            '\u2014': '-',    # Em-dash —
-            '\u2012': '-',    # Figure dash
-            '\u2015': '-',    # Horizontal bar
-            '\u00a0': ' ',    # Non-breaking space
-            '\u2003': ' ',    # Em space
-            '\u2002': ' ',    # En space
-            '\u2009': ' ',    # Thin space
-        }
-        
-        # Apply all replacements
-        for old, new in ligature_map.items():
-            text = text.replace(old, new)
-        
-        for old, new in quote_map.items():
-            text = text.replace(old, new)
-        
-        for old, new in dash_map.items():
-            text = text.replace(old, new)
-        
-        return text
-    
     def _insert_line_translation(
         self,
         page: pymupdf.Page,
@@ -2392,7 +2328,7 @@ class PDFProcessor:
         WHITE = pymupdf.pdfcolor["white"]
         
         # Normalize text for PDF rendering (handle ligatures, special chars)
-        translated_text = self._normalize_text_for_pdf(translated_text)
+        translated_text = _normalize_text_for_pdf(translated_text)
         
         # Clear all original spans (unless already cleared via redaction)
         if not skip_clearing:

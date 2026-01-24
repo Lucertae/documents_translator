@@ -68,7 +68,6 @@ except Exception as e:
 
 # Include app resources (with existence checks for CI compatibility)
 app_resources = [
-    ('app/deep_translator', 'app/deep_translator'),
     ('logs/README.txt', 'logs'),
     ('output/README.txt', 'output'),
     ('assets/icon.png', 'assets'),
@@ -159,7 +158,6 @@ hiddenimports = [
     'app.ui',
     'app.ui.main_window',
     'app.ui.pdf_viewer',
-    'app.deep_translator',
 ]
 
 # Collect all submodules for complex packages

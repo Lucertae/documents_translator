@@ -37,8 +37,6 @@ from .sentry_integration import (
     set_context,
     is_initialized,
     flush,
-    track_pdf_operation,
-    track_translation,
     configure_qt_exception_hook,
 )
 
@@ -72,7 +70,5 @@ __all__ = [
     'set_context',
     'is_initialized',
     'flush',
-    'track_pdf_operation',
-    'track_translation',
     'configure_qt_exception_hook',
 ]

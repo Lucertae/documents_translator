@@ -8,21 +8,16 @@ echo.
 echo Installazione librerie Python necessarie...
 echo.
 
-pip install PyMuPDF Pillow argostranslate
-
-echo.
-echo ========================================
-echo Installazione modelli Argos Translate...
-echo ========================================
-echo.
-
-cd /d "%~dp0\app"
-python setup_argos_models.py
+cd /d "%~dp0"
+pip install -r requirements.txt
 
 echo.
 echo ========================================
 echo INSTALLAZIONE COMPLETATA!
 echo ========================================
+echo.
+echo I modelli di traduzione OPUS-MT verranno scaricati automaticamente
+echo al primo avvio dell'applicazione.
 echo.
 echo Ora puoi avviare LAC TRANSLATE con: AVVIA_GUI.bat
 echo.

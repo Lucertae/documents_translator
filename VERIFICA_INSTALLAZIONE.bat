@@ -56,10 +56,10 @@ if exist "app\main_qt.py" (
     echo ✗ GUI principale mancante
 )
 
-if exist "app\setup_argos_models.py" (
-    echo ✓ Setup Argos presente
+if exist "app\core\translator.py" (
+    echo ✓ Translation engine presente (OPUS-MT)
 ) else (
-    echo ✗ Setup Argos mancante
+    echo ✗ Translation engine mancante
 )
 echo.
 
