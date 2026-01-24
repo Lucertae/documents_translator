@@ -19,8 +19,6 @@ from ..core import TranslationEngine, PDFProcessor
 from ..core.sentry_integration import (
     capture_exception,
     add_breadcrumb,
-    track_pdf_operation,
-    track_translation,
     set_context,
 )
 
@@ -1026,7 +1024,12 @@ class MainWindow(QMainWindow):
             )
             
             # Track successful PDF open
-            track_pdf_operation("open", file_path, page_count=self.pdf_processor.page_count)
+            add_breadcrumb(
+                message=f"PDF opened: {Path(file_path).name}",
+                category="pdf",
+                level="info",
+                data={"file_path": file_path, "page_count": self.pdf_processor.page_count}
+            )
             set_context("current_document", {
                 "filename": filename,
                 "page_count": self.pdf_processor.page_count,
@@ -1118,10 +1121,15 @@ class MainWindow(QMainWindow):
             return
         
         # Track translation start
-        track_translation(
-            self.translator.source_lang,
-            self.translator.target_lang,
-            self.current_page
+        add_breadcrumb(
+            message=f"Starting translation: page {self.current_page + 1}",
+            category="translation",
+            level="info",
+            data={
+                "source_lang": self.translator.source_lang,
+                "target_lang": self.translator.target_lang,
+                "page": self.current_page + 1,
+            }
         )
         
         self.progress_container.setVisible(True)
@@ -1400,7 +1408,12 @@ class MainWindow(QMainWindow):
             output_doc.close()
             
             # Track successful save
-            track_pdf_operation("save", file_path, pages_saved=len(self.translated_pages))
+            add_breadcrumb(
+                message=f"PDF saved: {Path(file_path).name}",
+                category="pdf",
+                level="info",
+                data={"file_path": file_path, "pages_saved": len(self.translated_pages)}
+            )
             
             self.status_bar.showMessage(f"Saved: {Path(file_path).name}", 5000)
             QMessageBox.information(

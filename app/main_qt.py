@@ -8,7 +8,7 @@ import logging
 import atexit
 from pathlib import Path
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 
 # Add parent directory to path for proper imports
 app_dir = Path(__file__).parent
@@ -21,6 +21,8 @@ from app.core.sentry_integration import (
     configure_qt_exception_hook,
     flush as sentry_flush,
     set_context,
+    capture_message,
+    add_breadcrumb,
 )
 
 
@@ -39,6 +41,30 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
+
+
+def qt_message_handler(mode: QtMsgType, context, message: str):
+    """
+    Custom Qt message handler to capture Qt warnings/errors to Sentry.
+    """
+    if mode == QtMsgType.QtDebugMsg:
+        logging.debug(f"Qt Debug: {message}")
+    elif mode == QtMsgType.QtInfoMsg:
+        logging.info(f"Qt Info: {message}")
+    elif mode == QtMsgType.QtWarningMsg:
+        logging.warning(f"Qt Warning: {message}")
+        add_breadcrumb(
+            message=f"Qt Warning: {message}",
+            category="qt",
+            level="warning",
+        )
+    elif mode == QtMsgType.QtCriticalMsg:
+        logging.error(f"Qt Critical: {message}")
+        capture_message(f"Qt Critical Error: {message}", level="error")
+    elif mode == QtMsgType.QtFatalMsg:
+        logging.critical(f"Qt Fatal: {message}")
+        capture_message(f"Qt Fatal Error: {message}", level="fatal")
+        sentry_flush(timeout=2.0)
 
 
 def setup_sentry():
@@ -72,6 +98,9 @@ def main():
     
     # Initialize Sentry error tracking
     setup_sentry()
+    
+    # Install Qt message handler to capture Qt warnings/errors
+    qInstallMessageHandler(qt_message_handler)
     
     # Create application
     app = QApplication(sys.argv)

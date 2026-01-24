@@ -57,13 +57,30 @@ def _load_env_file():
     """Load environment variables from .env file if python-dotenv is available."""
     try:
         from dotenv import load_dotenv
-        # Look for .env file in project root
-        project_root = Path(__file__).parent.parent.parent
-        env_file = project_root / ".env"
-        if env_file.exists():
-            load_dotenv(env_file)
-            logger.debug(f"Loaded environment from {env_file}")
-            return True
+        
+        # Multiple locations to search for .env file
+        search_paths = [
+            # 1. Project root (development)
+            Path(__file__).parent.parent.parent / ".env",
+            # 2. Current working directory
+            Path.cwd() / ".env",
+            # 3. Executable directory (PyInstaller bundle)
+            Path(sys.executable).parent / ".env",
+            # 4. Parent of executable (for dist/lac-translate structure)
+            Path(sys.executable).parent.parent / ".env",
+            # 5. Home directory config
+            Path.home() / ".lac-translate" / ".env",
+        ]
+        
+        for env_file in search_paths:
+            if env_file.exists():
+                load_dotenv(env_file)
+                logger.debug(f"Loaded environment from {env_file}")
+                return True
+        
+        logger.debug(f".env file not found in any of: {[str(p) for p in search_paths]}")
+        return False
+        
     except ImportError:
         logger.debug("python-dotenv not installed, skipping .env file loading")
     return False
@@ -121,6 +138,16 @@ def init_sentry(
         release = "lac-translate@unknown"
     
     try:
+        # Import integrations
+        from sentry_sdk.integrations.logging import LoggingIntegration
+        from sentry_sdk.integrations.threading import ThreadingIntegration
+        
+        # Configure logging integration to capture ERROR and above as events
+        logging_integration = LoggingIntegration(
+            level=logging.INFO,          # Capture INFO and above as breadcrumbs
+            event_level=logging.ERROR,   # Send ERROR and above as events
+        )
+        
         sentry_sdk.init(
             dsn=dsn,
             release=release,
@@ -133,9 +160,18 @@ def init_sentry(
             # Attach stack traces to logged errors
             attach_stacktrace=True,
             # Set reasonable max breadcrumbs
-            max_breadcrumbs=50,
+            max_breadcrumbs=100,
+            # Integrations for better error capturing
+            integrations=[
+                logging_integration,
+                ThreadingIntegration(propagate_hub=True),
+            ],
             # Before send hook for filtering/enriching events
             before_send=_before_send,
+            # Include local variables in stack traces
+            include_local_variables=True,
+            # Auto session tracking
+            auto_session_tracking=True,
         )
         
         # Set initial context
@@ -429,6 +465,7 @@ def configure_qt_exception_hook() -> None:
     
     Qt has its own exception handling that can swallow Python exceptions.
     This ensures exceptions in Qt callbacks are still reported to Sentry.
+    Also configures threading exception hook for Python 3.8+.
     """
     sentry_sdk = _get_sentry_sdk()
     if not sentry_sdk or not _sentry_initialized:
@@ -441,14 +478,43 @@ def configure_qt_exception_hook() -> None:
             sys.__excepthook__(exc_type, exc_value, exc_tb)
             return
         
-        # Capture to Sentry
-        capture_exception(exc_value)
+        # Skip SystemExit with code 0 (normal exit)
+        if issubclass(exc_type, SystemExit) and (exc_value is None or exc_value.code == 0):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        
+        # Capture to Sentry with full context
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("exception.source", "sys.excepthook")
+            scope.set_tag("exception.type", exc_type.__name__)
+            sentry_sdk.capture_exception((exc_type, exc_value, exc_tb))
         
         # Call default handler
         sys.__excepthook__(exc_type, exc_value, exc_tb)
     
+    # Set the main exception hook
     sys.excepthook = exception_hook
-    logger.debug("Qt exception hook configured for Sentry")
+    
+    # Also configure threading exception hook (Python 3.8+)
+    import threading
+    def threading_exception_hook(args):
+        """Handle uncaught exceptions in threads."""
+        if args.exc_type == SystemExit:
+            return
+        
+        with sentry_sdk.push_scope() as scope:
+            scope.set_tag("exception.source", "threading.excepthook")
+            scope.set_tag("exception.type", args.exc_type.__name__)
+            scope.set_tag("thread.name", args.thread.name if args.thread else "unknown")
+            sentry_sdk.capture_exception((args.exc_type, args.exc_value, args.exc_traceback))
+        
+        # Log to stderr
+        logger.error(f"Uncaught exception in thread {args.thread}: {args.exc_value}", 
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+    
+    threading.excepthook = threading_exception_hook
+    
+    logger.debug("Qt and threading exception hooks configured for Sentry")
 
 
 def flush(timeout: float = 2.0) -> None:

@@ -72,6 +72,8 @@ app_resources = [
     ('logs/README.txt', 'logs'),
     ('output/README.txt', 'output'),
     ('assets/icon.png', 'assets'),
+    ('assets/icon.ico', 'assets'),
+    ('.env', '.'),  # Include .env for Sentry configuration
 ]
 for src, dst in app_resources:
     if os.path.exists(src):
