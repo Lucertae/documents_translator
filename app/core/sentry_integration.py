@@ -241,6 +241,7 @@ def capture_exception(
     context: Optional[Dict[str, Any]] = None,
     level: str = "error",
     fingerprint: Optional[list] = None,
+    tags: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """
     Capture an exception and send it to Sentry.
@@ -250,6 +251,7 @@ def capture_exception(
         context: Additional context to attach to the event.
         level: Error level (error, warning, info, debug).
         fingerprint: Custom fingerprint for grouping similar errors.
+        tags: Key-value tags for filtering/searching in Sentry dashboard.
     
     Returns:
         Event ID if captured successfully, None otherwise.
@@ -263,6 +265,10 @@ def capture_exception(
             if context:
                 for key, value in context.items():
                     scope.set_extra(key, value)
+            
+            if tags:
+                for key, value in tags.items():
+                    scope.set_tag(key, value)
             
             if level:
                 scope.level = level
