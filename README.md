@@ -178,10 +178,10 @@ Il test genera immagini affiancate: **originale a sinistra, tradotto a destra**.
 
 | Documento | Tipo | Pagine | Note |
 |-----------|------|--------|------|
-| Coates_825.pdf | PDF nativo | 36 | Testo denso, footnotes |
-| Trotec Distribution Contract | Scansione | 21 | Contratto, OCR |
-| Mimaki Agreement | Scansione | 13 | Landscape, OCR |
-| confidenziali/*.pdf | Vari | - | Documenti reali |
+| xxx_825.pdf | PDF nativo | 36 | Testo denso, footnotes |
+| xxx | Scansione | 21 | Contratto, OCR |
+| xxx | Scansione | 13 | Landscape, OCR |
+| xxx pdf | Vari | - | Documenti reali |
 
 ---
 
@@ -397,3 +397,4 @@ python -c "from app.__version__ import get_version_with_build; print(get_version
 ## �📜 Licenza
 
 Apache 2.0 - Basato su pdf-translator-for-human
+
