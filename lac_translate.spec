@@ -1,6 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 LAC Translate - PyInstaller Build Specification (Windows & Linux)
+
+IMPORTANT: Before building on Windows, run:
+  python scripts/download_ocr_models.py
+
+This ensures all PaddleOCR models are pre-downloaded.
 """
 
 import sys
@@ -77,6 +82,32 @@ app_resources = [
 for src, dst in app_resources:
     if os.path.exists(src):
         datas.append((src, dst))
+
+# Include pre-downloaded PaddleOCR models (run scripts/download_ocr_models.py first)
+paddle_models_dir = 'paddle_models'
+if os.path.exists(paddle_models_dir):
+    print(f"Including pre-downloaded PaddleOCR models from {paddle_models_dir}")
+    for root, dirs, files in os.walk(paddle_models_dir):
+        for f in files:
+            src = os.path.join(root, f)
+            dst = os.path.relpath(root, '.')
+            datas.append((src, dst))
+else:
+    print("WARNING: paddle_models directory not found!")
+    print("Run 'python scripts/download_ocr_models.py' before building.")
+
+# Also include ~/.paddlex models if they exist (user home cached models)
+import pathlib
+paddlex_home = pathlib.Path.home() / '.paddlex' / 'official_models'
+if paddlex_home.exists():
+    print(f"Including PaddleX cached models from {paddlex_home}")
+    for model_dir in paddlex_home.iterdir():
+        if model_dir.is_dir():
+            for root, dirs, files in os.walk(model_dir):
+                for f in files:
+                    src = str(pathlib.Path(root) / f)
+                    rel_root = os.path.relpath(root, str(paddlex_home.parent.parent))
+                    datas.append((src, rel_root))
 
 # Hidden imports for dynamic loading
 hiddenimports = [
@@ -187,9 +218,9 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=['hooks'],  # Use our custom hooks for paddle/paddleocr/paddlex
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['hooks/rthook_paddle.py'],  # Setup paddle environment before import
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

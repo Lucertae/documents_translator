@@ -27,6 +27,21 @@ import numpy as np
 # Environment setup for PaddlePaddle CPU (must be before PaddleOCR import)
 os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
 
+# Setup model paths for frozen (PyInstaller) environment
+import sys
+if getattr(sys, 'frozen', False):
+    # Running as PyInstaller bundle
+    _app_dir = os.path.dirname(sys.executable)
+    _paddle_models = os.path.join(_app_dir, 'paddle_models')
+    _paddlex_models = os.path.join(_app_dir, '.paddlex', 'official_models')
+    
+    # Set environment variables for model locations
+    if os.path.exists(_paddle_models):
+        os.environ.setdefault('PADDLE_HOME', _paddle_models)
+        os.environ.setdefault('PADDLEOCR_HOME', _paddle_models)
+    if os.path.exists(_paddlex_models):
+        os.environ.setdefault('PADDLEX_HOME', os.path.join(_app_dir, '.paddlex'))
+
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
 

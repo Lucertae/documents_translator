@@ -43,6 +43,13 @@ jobs:
           python -c "import PySide6; print(f'PySide6: {PySide6.__version__}')"
           python -c "import torch; print(f'PyTorch: {torch.__version__}')"
           python -c "import fitz; print(f'PyMuPDF: {fitz.version}')"
+          python -c "import paddle; print(f'PaddlePaddle: {paddle.__version__}')"
+          python -c "import paddleocr; print('PaddleOCR: OK')"
+
+      - name: Download OCR models
+        run: |
+          python scripts/download_ocr_models.py
+        continue-on-error: true
 
       - name: Build with PyInstaller
         run: |
