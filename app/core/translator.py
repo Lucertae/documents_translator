@@ -291,7 +291,7 @@ class TranslationEngine:
         
         # Return cached model if available (and move to end for LRU)
         if lang_pair in cls._model_cache:
-            logging.debug(f"Using cached OPUS-MT model: {source_lang} → {target_lang}")
+            logging.debug(f"Using cached OPUS-MT model: {source_lang} -> {target_lang}")
             # Move to end of order (most recently used)
             if lang_pair in cls._model_cache_order:
                 cls._model_cache_order.remove(lang_pair)
@@ -304,14 +304,14 @@ class TranslationEngine:
                 oldest = cls._model_cache_order.pop(0)
                 if oldest in cls._model_cache:
                     del cls._model_cache[oldest]
-                    logging.info(f"Evicted cached model: {oldest[0]} → {oldest[1]}")
+                    logging.info(f"Evicted cached model: {oldest[0]} -> {oldest[1]}")
         
         # Get model name for this language pair
         model_name = cls.OPUS_MODEL_MAP.get(lang_pair)
         
         if not model_name:
-            logging.warning(f"No OPUS-MT model for {source_lang} → {target_lang}")
-            raise ValueError(f"Language pair not supported: {source_lang} → {target_lang}")
+            logging.warning(f"No OPUS-MT model for {source_lang} -> {target_lang}")
+            raise ValueError(f"Language pair not supported: {source_lang} -> {target_lang}")
         
         logging.info(f"Loading OPUS-MT model: {model_name}...")
         
@@ -326,7 +326,7 @@ class TranslationEngine:
             cls._model_cache[lang_pair] = (model, tokenizer)
             cls._model_cache_order.append(lang_pair)
             
-            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} → {target_lang} (cache: {len(cls._model_cache)}/{cls._MAX_CACHED_MODELS})")
+            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} -> {target_lang} (cache: {len(cls._model_cache)}/{cls._MAX_CACHED_MODELS})")
             
         except Exception as e:
             capture_exception(e, context={
@@ -521,7 +521,7 @@ class TranslationEngine:
             ratio = translated_words / original_words if original_words > 0 else 1.0
             
             logging.debug(
-                f"OPUS-MT: '{text[:50]}...' ({original_words}w) → "
+                f"OPUS-MT: '{text[:50]}...' ({original_words}w) -> "
                 f"'{translation[:50]}...' ({translated_words}w, {ratio:.1%})"
             )
             
@@ -543,7 +543,7 @@ class TranslationEngine:
             self.source_lang = source_lang
             self.target_lang = target_lang
             self._load_model(source_lang, target_lang)
-            logging.info(f"Languages updated: {source_lang} → {target_lang}")
+            logging.info(f"Languages updated: {source_lang} -> {target_lang}")
     
     @classmethod
     def get_language_code(cls, language_name: str) -> str:

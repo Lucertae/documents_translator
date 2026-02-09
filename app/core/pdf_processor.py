@@ -2285,7 +2285,7 @@ class PDFProcessor:
         if current_group:
             merged_groups.append(current_group)
         
-        logging.info(f"Cross-block merge: {len(text_blocks)} blocks → {len(merged_groups)} paragraph groups")
+        logging.info(f"Cross-block merge: {len(text_blocks)} blocks -> {len(merged_groups)} paragraph groups")
         
         return merged_groups
     
