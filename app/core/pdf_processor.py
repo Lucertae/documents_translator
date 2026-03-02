@@ -704,190 +704,184 @@ class PDFProcessor:
             logging.info(f"Page {page_num + 1}: Translated {len(translated_elements)} elements")
             
             # ============================================
-            # STEP 5: Render translated elements on clean page
+            # STEP 5: Build single HTML document and render
             # ============================================
+            # Instead of inserting elements one-by-one (which wastes space
+            # on height estimation and causes overflow), build ALL content
+            # as a single HTML document. PyMuPDF's insert_htmlbox() with
+            # scale_low=0 will auto-scale the content to fit the page.
+            
             new_page = new_doc[0]
             
             # Clear everything — draw white rectangle over entire page
             new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
             
-            # Page margins
-            margin_left = max(36, page_width * 0.06)
-            margin_right = max(36, page_width * 0.06)
-            margin_top = max(45, page_height * 0.05)
-            margin_bottom = max(45, page_height * 0.05)
+            # Adaptive margins — tighter for dense content
+            total_chars = sum(len(e.get('text', '')) for e in translated_elements)
+            is_dense = total_chars > 2000 or len(translated_elements) > 20
             
-            # Text area
-            text_x0 = margin_left
-            text_x1 = page_width - margin_right
-            text_width = text_x1 - text_x0
+            if is_dense:
+                margin_lr = max(28, page_width * 0.04)
+                margin_top = max(30, page_height * 0.035)
+                margin_bottom = max(30, page_height * 0.035)
+            else:
+                margin_lr = max(36, page_width * 0.06)
+                margin_top = max(40, page_height * 0.045)
+                margin_bottom = max(40, page_height * 0.045)
+            
+            text_rect = pymupdf.Rect(
+                margin_lr, margin_top,
+                page_width - margin_lr, page_height - margin_bottom
+            )
+            text_width = text_rect.width
             
             if text_width < 100:
-                text_x0 = 20
-                text_x1 = page_width - 20
-                text_width = text_x1 - text_x0
+                text_rect = pymupdf.Rect(
+                    20, margin_top,
+                    page_width - 20, page_height - margin_bottom
+                )
+                text_width = text_rect.width
             
             # Base font sizing — adaptive based on page size
-            # Standard A4 is 595 wide, typical body text is 10-11pt
-            body_font_size = max(8.5, min(11, text_width / 48))
+            body_font_size = max(8, min(11, text_width / 50))
             
-            # Heading sizes
-            heading_sizes = {
-                1: body_font_size * 1.6,   # ~17.6pt for main title
-                2: body_font_size * 1.35,  # ~14.9pt for sections
-                3: body_font_size * 1.15,  # ~12.7pt for subsections
-                4: body_font_size * 1.05,  # ~11.6pt
-                5: body_font_size,         # same as body
-                6: body_font_size,
-            }
+            # CSS color
+            css_color = f"rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)})"
             
-            current_y = margin_top
-            total_inserted = 0
-            body_paragraph_gap = body_font_size * 0.7  # Gap between paragraphs
-            heading_gap_before = body_font_size * 1.2  # Gap before headings
-            heading_gap_after = body_font_size * 0.5   # Gap after headings
-            
+            # Build HTML document from all translated elements
+            html_parts = []
             for elem in translated_elements:
-                if current_y >= page_height - margin_bottom:
-                    logging.warning(
-                        f"Page {page_num + 1}: Ran out of space, "
-                        f"{len(translated_elements) - total_inserted} elements remaining"
-                    )
-                    break
-                
                 elem_type = elem['type']
-                elem_text = elem['text']
+                elem_text = elem.get('text', '').strip()
                 
-                if not elem_text or not elem_text.strip():
+                if not elem_text:
                     continue
                 
-                # Determine font size and style based on element type
                 if elem_type == 'heading':
-                    level = elem.get('level', 1)
-                    font_size = heading_sizes.get(level, body_font_size)
-                    is_bold = True
-                    gap_before = heading_gap_before if total_inserted > 0 else 0
-                    gap_after = heading_gap_after
-                    align = 0  # Left-aligned
+                    level = min(elem.get('level', 1), 6)
+                    html_parts.append(
+                        f'<h{level}>{_escape_html(elem_text)}</h{level}>'
+                    )
                 elif elem_type == 'table':
-                    font_size = body_font_size * 0.9
-                    is_bold = False
-                    gap_before = body_paragraph_gap
-                    gap_after = body_paragraph_gap
-                    align = 0
+                    table_html = self._render_table_as_html(
+                        elem_text, body_font_size, text_color
+                    )
+                    html_parts.append(table_html)
                 else:  # paragraph
-                    font_size = body_font_size
-                    is_bold = False
-                    gap_before = body_paragraph_gap if total_inserted > 0 else 0
-                    gap_after = 0
-                    align = 0
-                
-                current_y += gap_before
-                
-                if current_y >= page_height - margin_bottom:
-                    break
-                
-                # Estimate text height
-                chars_per_line = max(1, int(text_width / (font_size * 0.5)))
-                estimated_lines = max(1, len(elem_text) / chars_per_line + 1)
-                estimated_height = estimated_lines * font_size * 1.3
-                
-                # Available space
-                available_height = page_height - margin_bottom - current_y
-                box_height = min(estimated_height * 1.5, available_height)
-                
-                if box_height < font_size * 1.5:
-                    break  # Not enough space
-                
-                text_rect = pymupdf.Rect(text_x0, current_y, text_x1, current_y + box_height)
-                
-                try:
-                    if elem_type == 'table':
-                        # Tables: use HTML rendering for proper grid
-                        table_html = self._render_table_as_html(elem_text, font_size, text_color)
-                        css = f"""* {{
-                            font-family: Helvetica, Arial, sans-serif;
-                            font-size: {font_size}pt;
-                            color: rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)});
-                            line-height: 1.3;
-                            padding: 0;
-                            margin: 0;
-                        }}
-                        table {{ border-collapse: collapse; width: 100%; }}
-                        td, th {{ border: 1px solid #ccc; padding: 4px 6px; text-align: left; }}
-                        th {{ font-weight: bold; background-color: #f5f5f5; }}
-                        """
-                        result = new_page.insert_htmlbox(text_rect, table_html, css=css, scale_low=0.5)
-                        if result[0] < 0:
-                            # Didn't fit, try with actual content
-                            excess = new_page.insert_textbox(
-                                text_rect, elem_text,
-                                fontsize=font_size, fontname="helv",
-                                color=text_color, align=align,
-                            )
-                    elif elem_type == 'heading':
-                        # Headings: use HTML for bold rendering
-                        heading_html = f"<b>{_escape_html(elem_text)}</b>"
-                        css_color = f"rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)})"
-                        css = f"""* {{
-                            font-family: Helvetica, Arial, sans-serif;
-                            font-size: {font_size}pt;
-                            color: {css_color};
-                            font-weight: bold;
-                            line-height: 1.2;
-                            padding: 0;
-                            margin: 0;
-                        }}
-                        b {{ font-weight: bold; }}
-                        """
-                        result = new_page.insert_htmlbox(text_rect, heading_html, css=css, scale_low=0.6)
-                        if result[0] >= 0:
-                            actual_height = box_height - result[0] if result[0] > 0 else font_size * 1.3
-                        else:
-                            actual_height = font_size * 1.3
-                    else:
-                        # Paragraphs: use textbox for clean rendering
-                        excess = new_page.insert_textbox(
-                            text_rect,
-                            elem_text,
-                            fontsize=font_size,
-                            fontname="helv",
-                            color=text_color,
-                            align=align,
-                        )
-                        
-                        if excess < 0:
-                            # Text didn't fit — try smaller font
-                            smaller_font = max(7, font_size * 0.8)
-                            expanded_rect = pymupdf.Rect(
-                                text_x0, current_y, text_x1,
-                                current_y + box_height * 1.5
-                            )
-                            excess = new_page.insert_textbox(
-                                expanded_rect, elem_text,
-                                fontsize=smaller_font, fontname="helv",
-                                color=text_color, align=align,
-                            )
-                            actual_height = box_height * 1.5 if excess >= 0 else box_height
-                        else:
-                            actual_height = box_height - excess if excess > 0 else box_height
-                    
-                    # Calculate actual height used
-                    if elem_type == 'table':
-                        actual_height = box_height  # Tables use full height
-                    elif elem_type != 'heading':
-                        pass  # Already calculated above
-                    
-                    current_y += actual_height + gap_after
-                    total_inserted += 1
-                    
-                except Exception as e:
-                    logging.debug(f"Failed to insert {elem_type} element: {e}")
-                    current_y += font_size * 2  # Skip space and continue
+                    html_parts.append(
+                        f'<p>{_escape_html(elem_text)}</p>'
+                    )
+            
+            full_html = '\n'.join(html_parts)
+            
+            # Build CSS stylesheet
+            # Heading scale factors: h1=1.5x, h2=1.3x, h3=1.15x, h4=1.05x
+            h1_size = body_font_size * 1.5
+            h2_size = body_font_size * 1.3
+            h3_size = body_font_size * 1.15
+            h4_size = body_font_size * 1.05
+            
+            # Tighter spacing for dense pages
+            if is_dense:
+                p_margin = f"{body_font_size * 0.25:.1f}pt"
+                h_margin_top = f"{body_font_size * 0.5:.1f}pt"
+                h_margin_bottom = f"{body_font_size * 0.2:.1f}pt"
+                line_height = "1.15"
+            else:
+                p_margin = f"{body_font_size * 0.4:.1f}pt"
+                h_margin_top = f"{body_font_size * 0.8:.1f}pt"
+                h_margin_bottom = f"{body_font_size * 0.3:.1f}pt"
+                line_height = "1.25"
+            
+            css = f"""
+            * {{
+                font-family: Helvetica, Arial, sans-serif;
+                color: {css_color};
+                margin: 0;
+                padding: 0;
+            }}
+            p {{
+                font-size: {body_font_size:.1f}pt;
+                line-height: {line_height};
+                margin-top: {p_margin};
+                margin-bottom: {p_margin};
+                text-align: justify;
+            }}
+            h1 {{
+                font-size: {h1_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.15;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h2 {{
+                font-size: {h2_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.15;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h3 {{
+                font-size: {h3_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.2;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h4, h5, h6 {{
+                font-size: {h4_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.2;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            table {{
+                border-collapse: collapse;
+                width: 100%;
+                margin-top: {p_margin};
+                margin-bottom: {p_margin};
+            }}
+            td, th {{
+                border: 1px solid #ccc;
+                padding: 3px 5px;
+                text-align: left;
+                font-size: {body_font_size * 0.88:.1f}pt;
+                line-height: 1.15;
+            }}
+            th {{
+                font-weight: bold;
+                background-color: #f5f5f5;
+            }}
+            """
+            
+            # Render everything in a single call with auto-scaling
+            # scale_low=0 means PyMuPDF will shrink content as much as
+            # needed to fit; minimum readable is ~0.3 of original
+            result = new_page.insert_htmlbox(
+                text_rect, full_html, css=css, scale_low=0
+            )
+            spare_height, scale = result
+            
+            total_inserted = len(translated_elements)
+            
+            if spare_height < 0:
+                # Even with unlimited scaling, content didn't fit
+                # (this should be very rare with scale_low=0)
+                logging.warning(
+                    f"Page {page_num + 1}: Content could not fit even with "
+                    f"full scaling (scale={scale:.2f})"
+                )
+            elif scale < 1.0:
+                logging.info(
+                    f"Page {page_num + 1}: Content auto-scaled to "
+                    f"{scale:.0%} to fit page "
+                    f"(spare={spare_height:.0f}pt)"
+                )
             
             logging.info(
                 f"Page {page_num + 1}: RapidDoc clean page created with "
-                f"{total_inserted} translated elements"
+                f"{total_inserted} translated elements "
+                f"(scale={scale:.0%}, spare_height={spare_height:.0f}pt)"
             )
             return new_doc
             
