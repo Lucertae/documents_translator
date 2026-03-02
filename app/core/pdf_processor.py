@@ -1,5 +1,5 @@
 """
-PDF processing module - GLM-OCR Edition
+PDF processing module - RapidOCR Edition
 Handles PDF loading, text extraction, OCR, and manipulation with superior quality.
 
 SPAN-LEVEL FORMATTING PRESERVATION:
@@ -7,11 +7,11 @@ This module preserves formatting at the span level, not just line level.
 Bold, italic, color, and size are tracked per-segment and
 intelligently mapped to the translated text using proportional allocation.
 
-OCR Engine: GLM-OCR via Ollama
-- #1 on OmniDocBench V1.5 (94.62 score)
-- 0.9B parameters, multilingual, 128K context window
-- Text, table, and figure recognition modes
-- Handles multi-column layouts and complex documents internally
+OCR Engine: RapidOCR (ONNX Runtime + PP-OCRv4/v5)
+- ~1-3 secondi per pagina su CPU
+- Pipeline: text detection + direction classification + text recognition
+- Modelli PP-OCRv5 (detection) + PP-OCRv4 (recognition EN)
+- Nessun server esterno (tutto in-process)
 """
 import logging
 import math
@@ -63,13 +63,13 @@ from .sentry_integration import capture_exception, add_breadcrumb, set_context
 # NOTE: detect_title_or_heading moved to format_utils.py (simplified version)
 
 
-# OCR integration via GLM-OCR (Ollama)
+# OCR integration via RapidOCR (ONNX Runtime)
 try:
-    from .glm_ocr import GlmOcrEngine, check_ollama_status
-    _ocr_engine_instance = GlmOcrEngine()
+    from .rapid_ocr import RapidOcrEngine, check_ocr_status
+    _ocr_engine_instance = RapidOcrEngine()
     OCR_AVAILABLE = _ocr_engine_instance.is_available()
     if not OCR_AVAILABLE:
-        logging.warning("GLM-OCR not ready - run: ollama pull glm-ocr")
+        logging.warning("RapidOCR not ready - run: pip install rapidocr onnxruntime")
 except ImportError as e:
     OCR_AVAILABLE = False
     _ocr_engine_instance = None
@@ -78,14 +78,14 @@ except ImportError as e:
 
 class PDFProcessor:
     """
-    Professional PDF processor with GLM-OCR (state-of-the-art accuracy).
-    Supports normal PDFs and scanned documents via Ollama-based OCR.
+    Professional PDF processor with RapidOCR (fast ONNX-based OCR).
+    Supports normal PDFs and scanned documents via RapidOCR.
     
-    GLM-OCR Advantages:
-    - #1 on OmniDocBench V1.5 (94.62 score)
-    - Robust on complex tables, code, seals
-    - Easy deployment via Ollama
-    - Only 0.9B parameters (2.2GB model)
+    RapidOCR Advantages:
+    - ~1-3 sec/page on CPU (vs 5+ min with GLM-OCR)
+    - PP-OCRv4/v5 models via ONNX Runtime
+    - No external server needed (in-process)
+    - Automatic model download (~15 MB)
     """
     
     def __init__(self, pdf_path: str):
@@ -264,7 +264,7 @@ class PDFProcessor:
         
         Args:
             page_num: Page number to extract from
-            ocr_language: Language code for OCR (GLM-OCR is multilingual, used for logging)
+            ocr_language: Language code for OCR (used for logging)
             
         Returns:
             Extracted text with best possible quality
@@ -379,58 +379,49 @@ class PDFProcessor:
     
     def _extract_via_ocr(self, page: pymupdf.Page, language: str) -> str:
         """
-        Extract text using GLM-OCR via Ollama, con preprocessing robusto.
-        Stampa le caratteristiche del PNG preprocessato.
+        Extract text using RapidOCR, con preprocessing robusto.
+        
+        Lavora direttamente sulla pagina PyMuPDF senza scrivere PDF temporanei.
+        Logga le caratteristiche del PNG preprocessato.
         """
         global _ocr_engine_instance
         if _ocr_engine_instance is None:
-            logging.warning("GLM-OCR engine not available")
+            logging.warning("RapidOCR engine not available")
             return ""
         try:
-            logging.info(f"Attempting GLM-OCR extraction (language hint: {language}) [with advanced preprocessing]")
-            import tempfile
-            import os
-            from app.core.preprocess_for_ocr import preprocess_pdf_page
-            from PIL import Image
-            # Salva la singola pagina in un PDF temporaneo
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
-                pdf_bytes = page.parent.write()
-                tmp_pdf.write(pdf_bytes)
-                tmp_pdf_path = tmp_pdf.name
-            # Preprocessa la pagina (estrai PNG pulito)
-            png_path = preprocess_pdf_page(tmp_pdf_path, page.number, dpi=150)
-            # Leggi info PNG
-            with Image.open(png_path) as img:
-                width, height = img.size
-                dpi = img.info.get('dpi', (150, 150))
-                mode = img.mode
-                logging.info(f"PNG per OCR: {png_path} | Risoluzione: {width}x{height} px | DPI: {dpi} | Mode: {mode}")
-            with open(png_path, 'rb') as f:
-                img_data = f.read()
-            # Usa GLM-OCR per il riconoscimento
+            logging.info(f"RapidOCR extraction (lang={language}) [preprocessing attivo]")
+            from .preprocess_for_ocr import preprocess_page_from_pymupdf
+            
+            # Preprocessa direttamente dalla pagina (no file temporanei)
+            png_bytes, info = preprocess_page_from_pymupdf(page, dpi=150)
+            
+            logging.info(
+                f"PNG per OCR: {info['width']}x{info['height']} px | "
+                f"DPI={info['dpi']} | Mode={info['mode']} | "
+                f"Size={info['file_size_kb']} KB"
+            )
+            
+            # Usa RapidOCR per il riconoscimento
             text = _ocr_engine_instance.recognize_document_page(
-                img_data,
+                png_bytes,
                 detect_tables=True
             )
-            # Pulisci file temporanei
-            try:
-                os.remove(tmp_pdf_path)
-                os.remove(png_path)
-            except Exception:
-                pass
+            
             if text:
                 text = clean_ocr_text(text)
                 text = post_process_ocr_text(text)
-                logging.info(f"GLM-OCR successful: {len(text)} chars [preprocessed]")
+                logging.info(f"RapidOCR OK: {len(text)} chars")
                 return text
-            logging.warning("GLM-OCR returned no text [preprocessed]")
+            
+            logging.warning("RapidOCR returned no text")
             return ""
+            
         except Exception as e:
             capture_exception(e, context={
-                "operation": "glm_ocr_extract",
+                "operation": "rapidocr_extract",
                 "language": language,
             }, tags={"component": "ocr"})
-            logging.warning(f"GLM-OCR failed [preprocessed]: {e}")
+            logging.warning(f"RapidOCR failed: {e}")
             return ""
     
     def render_page(self, page_num: int, zoom: float = 1.0) -> Tuple[bytes, int, int]:
@@ -461,21 +452,15 @@ class PDFProcessor:
         ocr_language: str = "en"
     ) -> pymupdf.Document:
         """
-        Translate a scanned (image-based) page using GLM-OCR + CLEAN SLATE approach.
+        Translate a scanned (image-based) page using RapidOCR + CLEAN SLATE approach.
         
         Strategy:
         1. Render page to high-resolution image
-        2. GLM-OCR extracts all text (handles layout/columns internally)
+        2. RapidOCR extracts all text (detection + classification + recognition)
         3. Post-process OCR text (fix errors, normalize)
         4. Split into paragraphs and translate each
         5. Create CLEAN BLANK PAGE with same dimensions
         6. Insert translated text as flowing paragraphs
-        
-        GLM-OCR advantages over previous approach:
-        - Handles multi-column layouts internally (no separate layout detection)
-        - Understands document structure (headings, tables, lists)
-        - 128K context window for large pages
-        - #1 on OmniDocBench V1.5 (94.62 score)
         
         Args:
             new_doc: Document to modify (will be replaced with clean page)
@@ -483,7 +468,7 @@ class PDFProcessor:
             page_num: Page number (for logging)
             translator: Translation engine
             text_color: Color for translated text
-            ocr_language: Language code (for logging, GLM-OCR is multilingual)
+            ocr_language: Language code (for logging)
             
         Returns:
             New document with translated content on clean page
@@ -505,11 +490,10 @@ class PDFProcessor:
             pix = page.get_pixmap(matrix=pymupdf.Matrix(ocr_scale, ocr_scale))
             img_data = pix.tobytes("png")
             
-            logging.info(f"Page {page_num + 1}: Rendered to {pix.width}x{pix.height} for GLM-OCR")
+            logging.info(f"Page {page_num + 1}: Rendered to {pix.width}x{pix.height} for RapidOCR")
             
             # ============================================
-            # STEP 2: GLM-OCR text extraction
-            # GLM-OCR handles layout, columns, tables internally
+            # STEP 2: RapidOCR text extraction
             # ============================================
             ocr_text = _ocr_engine_instance.recognize_document_page(
                 img_data, 
@@ -517,10 +501,10 @@ class PDFProcessor:
             )
             
             if not ocr_text or len(ocr_text.strip()) < 5:
-                logging.warning(f"Page {page_num + 1}: GLM-OCR returned no usable text")
+                logging.warning(f"Page {page_num + 1}: RapidOCR returned no usable text")
                 return new_doc
             
-            logging.info(f"Page {page_num + 1}: GLM-OCR extracted {len(ocr_text)} chars")
+            logging.info(f"Page {page_num + 1}: RapidOCR extracted {len(ocr_text)} chars")
             
             # ============================================
             # STEP 3: Post-process OCR text
@@ -531,7 +515,7 @@ class PDFProcessor:
             # ============================================
             # STEP 4: Split into paragraphs and translate
             # ============================================
-            # GLM-OCR output uses double newlines for paragraphs
+            # OCR output uses double newlines for paragraphs
             raw_paragraphs = re.split(r'\n\s*\n', ocr_text)
             
             translated_paragraphs = []
@@ -677,7 +661,7 @@ class PDFProcessor:
         6. Phase 5: Insert translations with inline formatting preserved
         
         For scanned pages:
-        - Uses GLM-OCR via Ollama for text extraction
+        - Uses RapidOCR for text extraction
         - Creates clean page with translated text
         
         LINE-BY-LINE TRANSLATION (preserve_line_breaks=True):
@@ -1867,9 +1851,8 @@ class PDFProcessor:
     def get_ocr_language(cls, language_name: str) -> str:
         """Get language code from language name.
         
-        GLM-OCR is multilingual and doesn't require language-specific codes.
-        Returns a standard language code for logging/reference purposes.
+        RapidOCR handles multiple languages. Returns a standard language
+        code for logging/reference purposes.
         """
-        # GLM-OCR handles all languages natively; return code for logging only
         from .config import SUPPORTED_LANGUAGES
         return SUPPORTED_LANGUAGES.get(language_name, "en")
