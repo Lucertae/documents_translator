@@ -1,13 +1,14 @@
 # Building LAC Translate for Windows
 
-This guide explains how to build the Windows executable with full PaddleOCR support for scanned document translation.
+This guide explains how to build the Windows executable with GLM-OCR support (via Ollama) for scanned document translation.
 
 ## Prerequisites
 
 - Windows 10/11 (64-bit)
-- Python 3.11 (3.12+ may have compatibility issues with PaddlePaddle)
+- Python 3.11+
 - At least 8GB RAM for the build process
-- ~3GB free disk space
+- ~2GB free disk space
+- [Ollama](https://ollama.com/download) installed on the target machine (for OCR)
 
 ## Quick Build
 
@@ -20,8 +21,7 @@ build_windows.bat
 This will:
 1. Create a virtual environment
 2. Install all dependencies
-3. Download OCR models
-4. Build the executable
+3. Build the executable
 
 ## Manual Build Steps
 
@@ -34,17 +34,7 @@ pip install -r requirements.txt
 pip install pyinstaller
 ```
 
-### 2. Download OCR Models
-
-**IMPORTANT**: This step is required for scanned PDF support!
-
-```batch
-python scripts/download_ocr_models.py
-```
-
-This downloads the PaddleOCR PP-OCRv5 models (~500MB) and stores them in `paddle_models/`.
-
-### 3. Build
+### 2. Build
 
 ```batch
 pyinstaller lac_translate.spec --clean --noconfirm
@@ -52,30 +42,25 @@ pyinstaller lac_translate.spec --clean --noconfirm
 
 The executable will be in `dist/lac-translate/lac-translate.exe`.
 
+## OCR Setup (on target machine)
+
+GLM-OCR runs via Ollama, which must be installed separately:
+
+1. **Install Ollama**: Download from [ollama.com](https://ollama.com/download)
+2. **Pull the GLM-OCR model**:
+   ```batch
+   ollama pull glm-ocr
+   ```
+   This downloads the model (~2.2GB, one-time download).
+3. The application will automatically detect and use Ollama when processing scanned PDFs.
+
 ## Troubleshooting
 
-### "A dependency error occurred during pipeline creation"
+### "Ollama not available" or OCR not working
 
-This error means the OCR models are not found. Solutions:
-
-1. **Re-run model download**:
-   ```batch
-   python scripts/download_ocr_models.py
-   ```
-
-2. **Check models directory**: Ensure `paddle_models/` exists in the same directory as the executable.
-
-3. **Check PaddleX cache**: Models might also be in `%USERPROFILE%\.paddlex\official_models\`
-
-### "Failed to initialize PaddleOCR"
-
-1. **Update PaddlePaddle**:
-   ```batch
-   pip install paddlepaddle==3.2.1
-   pip install paddleocr>=3.3.0
-   ```
-
-2. **Install Visual C++ Redistributable**: Download from Microsoft.
+1. **Check Ollama is running**: Open a terminal and run `ollama list`
+2. **Pull the model**: `ollama pull glm-ocr`
+3. **Check Ollama server**: The app expects Ollama at `http://localhost:11434`
 
 ### Build takes too long / Out of memory
 
@@ -88,22 +73,21 @@ This error means the OCR models are not found. Solutions:
 ```
 dist/lac-translate/
 ├── lac-translate.exe      # Main executable
-├── paddle_models/         # OCR models (if downloaded)
-├── .paddlex/              # PaddleX models cache
-├── paddle/                # PaddlePaddle libraries
 ├── PySide6/               # Qt libraries
 └── ...                    # Other dependencies
 ```
 
 ## Testing the Build
 
-1. Run `dist/lac-translate/lac-translate.exe`
-2. Open a scanned PDF
-3. Click "Translate"
-4. If OCR works, the scanned text will be recognized and translated
+1. Ensure Ollama is running with GLM-OCR model pulled
+2. Run `dist/lac-translate/lac-translate.exe`
+3. Open a scanned PDF
+4. Click "Translate"
+5. If OCR works, the scanned text will be recognized and translated
 
 ## Notes
 
-- First run may take longer as models are loaded into memory
+- First run may take longer as translation models are loaded into memory
 - Translation models (~300MB per language pair) are downloaded on first use
-- For best OCR quality, use 300 DPI scans
+- GLM-OCR processes pages at high resolution for best accuracy
+- Ollama runs as a separate process and can use GPU if available

@@ -89,7 +89,7 @@ echo.
 REM ==========================================
 REM STEP 4: Verifica che PySide6 sia installato
 REM ==========================================
-echo [4/7] Verifico PySide6...
+echo [4/6] Verifico PySide6...
 
 python -c "import PySide6; print(f'    PySide6 versione: {PySide6.__version__}')" 2>nul
 if %errorlevel% neq 0 (
@@ -105,24 +105,9 @@ if %errorlevel% neq 0 (
 echo.
 
 REM ==========================================
-REM STEP 5: Download modelli OCR
+REM STEP 5: Build con PyInstaller
 REM ==========================================
-echo [5/7] Download modelli PaddleOCR (necessari per PDF scansionati)...
-echo     Questo puo' richiedere alcuni minuti al primo avvio...
-echo.
-
-python scripts/download_ocr_models.py
-if %errorlevel% neq 0 (
-    echo.
-    echo [AVVISO] Download modelli OCR fallito - le scansioni potrebbero non funzionare
-    echo Continuando comunque con la build...
-    echo.
-)
-
-REM ==========================================
-REM STEP 6: Build con PyInstaller
-REM ==========================================
-echo [6/7] Avvio build con PyInstaller...
+echo [5/6] Avvio build con PyInstaller...
 echo     Questo puo' richiedere 5-10 minuti...
 echo.
 
@@ -142,7 +127,7 @@ if %errorlevel% neq 0 (
 )
 
 REM ==========================================
-REM STEP 7: Verifica risultato e copia modelli
+REM STEP 6: Verifica risultato
 REM ==========================================
 if exist "dist\lac-translate\lac-translate.exe" (
     echo.

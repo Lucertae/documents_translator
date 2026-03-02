@@ -1,6 +1,6 @@
 # 🌍 LAC TRANSLATE - PDF Translator
 
-Traduttore PDF professionale con OPUS-MT e PaddleOCR.
+Traduttore PDF professionale con OPUS-MT e GLM-OCR.
 
 ---
 
@@ -265,7 +265,7 @@ SENTRY_ENVIRONMENT=development  # oppure: production, staging
 |--------|-----------|----------|
 | Errori PDF | `pdf` | Caricamento, estrazione testo, salvataggio |
 | Errori Traduzione | `translation` | Modello, encoding, timeout |
-| Errori OCR | `ocr` | PaddleOCR, layout detection |
+| Errori OCR | `ocr` | GLM-OCR, Ollama connectivity |
 | Errori UI | `ui` | Worker threads, callbacks Qt |
 
 ### Informazioni inviate

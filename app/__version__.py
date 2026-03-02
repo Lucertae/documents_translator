@@ -112,7 +112,7 @@ __version_info__ = (VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH)
 # Human-readable application info
 APP_NAME = "LAC Translate"
 APP_AUTHOR = "LUCERTAE SRLS"
-APP_DESCRIPTION = "Professional PDF Translation with OPUS-MT and PaddleOCR"
+APP_DESCRIPTION = "Professional PDF Translation with OPUS-MT and GLM-OCR"
 
 
 if __name__ == "__main__":

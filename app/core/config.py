@@ -4,11 +4,11 @@ Configuration constants for PDF processing and OCR.
 This module centralizes all tunable parameters and thresholds
 to improve maintainability and allow easy experimentation.
 
-PaddleOCR Configuration (v3.3.3 with PP-OCRv5):
-- Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug on CPU)
-- PP-OCRv5 provides best accuracy for scanned documents
-- Supports 80+ languages: en, it, fr, de, es, pt, zh, ja, ko, ar, ru, etc.
-- use_textline_orientation=True enables automatic text orientation detection
+OCR Engine: GLM-OCR via Ollama
+- #1 on OmniDocBench V1.5 (94.62 score)
+- 0.9B parameters, multilingual, 128K context window
+- Text, table, and figure recognition modes
+- Deployed via Ollama (CPU or GPU)
 """
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -20,11 +20,10 @@ from typing import Dict, Tuple
 
 @dataclass(frozen=True)
 class OCRConfig:
-    """Configuration for PaddleOCR engine (PP-OCRv5).
+    """Configuration for OCR engine (GLM-OCR via Ollama).
     
-    Recommended versions:
-    - PaddlePaddle: 3.2.x (3.3.0 has ONEDNN bug on CPU)
-    - PaddleOCR: 3.3.3 with PP-OCRv5 models
+    GLM-OCR handles most settings internally. These thresholds
+    control the PDF processor's decision logic around OCR.
     """
     
     # Recognition thresholds  
@@ -125,17 +124,6 @@ SERIF_FONT_PATTERNS = [
 # ============================================
 # Language Mappings
 # ============================================
-
-# PaddleOCR language codes
-PADDLEOCR_LANGUAGES: Dict[str, str] = {
-    "Italiano": "it",
-    "English": "en",
-    "Español": "es",
-    "Français": "fr",
-    "Deutsch": "de",
-    "Português": "pt",
-    "Nederlands": "nl",
-}
 
 # OPUS-MT model mapping
 OPUS_MODEL_MAP: Dict[Tuple[str, str], str] = {
