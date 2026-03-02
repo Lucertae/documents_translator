@@ -4,11 +4,11 @@ Configuration constants for PDF processing and OCR.
 This module centralizes all tunable parameters and thresholds
 to improve maintainability and allow easy experimentation.
 
-OCR Engine: GLM-OCR via Ollama
-- #1 on OmniDocBench V1.5 (94.62 score)
-- 0.9B parameters, multilingual, 128K context window
-- Text, table, and figure recognition modes
-- Deployed via Ollama (CPU or GPU)
+OCR Engine: RapidOCR v3 (ONNX Runtime)
+- PP-OCRv5 MOBILE (detection) + PP-OCRv4 LATIN SERVER (recognition)
+- ~1-3 secondi per pagina su CPU
+- Supporto multilingue (lingue latine: EN, IT, FR, DE, ES...)
+- Configurazione in app/core/rapid_ocr.py
 """
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -20,10 +20,10 @@ from typing import Dict, Tuple
 
 @dataclass(frozen=True)
 class OCRConfig:
-    """Configuration for OCR engine (GLM-OCR via Ollama).
+    """Configuration for OCR engine (RapidOCR).
     
-    GLM-OCR handles most settings internally. These thresholds
-    control the PDF processor's decision logic around OCR.
+    RapidOCR engine parameters are in rapid_ocr.py._build_engine_params().
+    These thresholds control the PDF processor's decision logic around OCR.
     """
     
     # Recognition thresholds  

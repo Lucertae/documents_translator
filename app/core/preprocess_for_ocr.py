@@ -1,5 +1,5 @@
 """
-Preprocessing robusto per pagine PDF da passare all'OCR (GLM-OCR/Ollama).
+Preprocessing robusto per pagine PDF da passare all'OCR (RapidOCR).
 
 Due modalità:
 - preprocess_page_from_pymupdf(page, ...): lavora direttamente sulla pagina PyMuPDF
@@ -8,11 +8,12 @@ Due modalità:
   (usato dagli script standalone)
 
 Operazioni:
-1. Renderizza pagina a DPI target (default 150)
+1. Renderizza pagina a DPI target (default 300)
 2. Ritaglia bordi bianchi
 3. Se troppo grande, riduce DPI e riprova
 4. Se troppo piccola, aggiunge padding bianco
-5. Converte in PNG RGB pulito
+5. Image enhancement (contrasto + sharpening)
+6. Converte in PNG RGB pulito
 """
 import io
 import logging
@@ -20,17 +21,21 @@ import tempfile
 
 import numpy as np
 import pymupdf
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Costanti
 # ---------------------------------------------------------------------------
-DEFAULT_DPI = 150
-MIN_SIDE = 300    # pixel minimi per lato
-MAX_SIDE = 2000   # pixel massimi per lato
-WHITE_THRESHOLD = 240  # soglia per rilevare bordi bianchi
+DEFAULT_DPI = 300       # 300 DPI = ottimale per OCR (precedente: 150, troppo basso)
+MIN_SIDE = 300           # pixel minimi per lato
+MAX_SIDE = 3000          # pixel massimi per lato (bilanciamento qualità/velocità)
+WHITE_THRESHOLD = 240    # soglia per rilevare bordi bianchi
+
+# Parametri image enhancement per OCR
+CONTRAST_FACTOR = 1.3    # Aumenta contrasto per migliorare rilevamento testo
+SHARPNESS_FACTOR = 1.5   # Leggero sharpening per bordi testo più nitidi
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +94,34 @@ def _render_page_to_pil(page: pymupdf.Page, dpi: int = DEFAULT_DPI) -> Image.Ima
 # Pipeline preprocessing completa
 # ---------------------------------------------------------------------------
 
+def enhance_for_ocr(pil_img: Image.Image) -> Image.Image:
+    """
+    Applica enhancement dell'immagine ottimizzato per OCR.
+
+    Operazioni:
+    1. Leggero aumento di contrasto (rende il testo più scuro e il background più chiaro)
+    2. Sharpening controllato (bordi del testo più definiti)
+
+    Nota: non applichiamo binarizzazione (bianco/nero) perché
+    RapidOCR lavora meglio con immagini a colori/grayscale.
+    """
+    # Aumento contrasto
+    enhancer = ImageEnhance.Contrast(pil_img)
+    pil_img = enhancer.enhance(CONTRAST_FACTOR)
+
+    # Sharpening controllato — migliora la leggibilità del testo
+    enhancer = ImageEnhance.Sharpness(pil_img)
+    pil_img = enhancer.enhance(SHARPNESS_FACTOR)
+
+    return pil_img
+
+
 def _preprocess_image(
     img: Image.Image,
     crop_borders: bool = True,
     min_size: int = MIN_SIDE,
     max_size: int = MAX_SIDE,
+    apply_enhancement: bool = True,
 ) -> Image.Image:
     """Applica la pipeline di preprocessing a un'immagine PIL."""
     # 1. Crop bordi bianchi
@@ -109,6 +137,10 @@ def _preprocess_image(
     # 4. Assicura RGB (no alpha, no palette)
     if img.mode != "RGB":
         img = img.convert("RGB")
+
+    # 5. Image enhancement per OCR (contrasto + sharpening)
+    if apply_enhancement:
+        img = enhance_for_ocr(img)
 
     return img
 
@@ -126,7 +158,7 @@ def preprocess_page_from_pymupdf(
 
     Args:
         page: Oggetto pymupdf.Page
-        dpi: DPI per il rendering (default 150)
+        dpi: DPI per il rendering (default 300)
         crop_borders: Se ritagliare bordi bianchi
         min_size: Dimensione minima lato (pixel)
         max_size: Dimensione massima lato (pixel)

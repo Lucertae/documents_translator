@@ -52,7 +52,7 @@ from .format_utils import (
 )
 
 # Import OCR post-processing
-from .ocr_utils import clean_ocr_text, post_process_ocr_text
+from .ocr_utils import post_process_ocr_text
 
 # Import Sentry integration
 from .sentry_integration import capture_exception, add_breadcrumb, set_context
@@ -390,10 +390,11 @@ class PDFProcessor:
             return ""
         try:
             logging.info(f"RapidOCR extraction (lang={language}) [preprocessing attivo]")
-            from .preprocess_for_ocr import preprocess_page_from_pymupdf
+            from .preprocess_for_ocr import preprocess_page_from_pymupdf, DEFAULT_DPI
             
             # Preprocessa direttamente dalla pagina (no file temporanei)
-            png_bytes, info = preprocess_page_from_pymupdf(page, dpi=150)
+            # DPI 300: coerente con max_side_len=3000 dell'engine RapidOCR
+            png_bytes, info = preprocess_page_from_pymupdf(page, dpi=DEFAULT_DPI)
             
             logging.info(
                 f"PNG per OCR: {info['width']}x{info['height']} px | "
@@ -408,7 +409,7 @@ class PDFProcessor:
             )
             
             if text:
-                text = clean_ocr_text(text)
+                # post_process_ocr_text include già clean_ocr_text come primo passo
                 text = post_process_ocr_text(text)
                 logging.info(f"RapidOCR OK: {len(text)} chars")
                 return text
@@ -509,7 +510,7 @@ class PDFProcessor:
             # ============================================
             # STEP 3: Post-process OCR text
             # ============================================
-            ocr_text = clean_ocr_text(ocr_text)
+            # post_process_ocr_text include già clean_ocr_text come primo passo
             ocr_text = post_process_ocr_text(ocr_text)
             
             # ============================================
