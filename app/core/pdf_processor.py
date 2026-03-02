@@ -75,6 +75,24 @@ except ImportError as e:
     _ocr_engine_instance = None
     logging.warning(f"OCR not available: {e}")
 
+# RapidDoc integration for structured document parsing (layout + OCR + table)
+try:
+    from .rapid_doc_engine import RapidDocEngine, check_rapiddoc_status
+    _rapiddoc_engine_instance = RapidDocEngine()
+    RAPIDDOC_AVAILABLE = _rapiddoc_engine_instance.is_available()
+    if RAPIDDOC_AVAILABLE:
+        logging.info("RapidDoc engine available — structured document parsing enabled")
+    else:
+        logging.info("RapidDoc not available, using plain RapidOCR for scanned pages")
+except ImportError as e:
+    RAPIDDOC_AVAILABLE = False
+    _rapiddoc_engine_instance = None
+    logging.info(f"RapidDoc not available: {e}")
+except Exception as e:
+    RAPIDDOC_AVAILABLE = False
+    _rapiddoc_engine_instance = None
+    logging.warning(f"RapidDoc initialization error: {e}")
+
 
 class PDFProcessor:
     """
@@ -276,6 +294,20 @@ class PDFProcessor:
         
         if is_scanned:
             logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason}), using OCR directly")
+            # Prefer RapidDoc for structured text extraction
+            if RAPIDDOC_AVAILABLE:
+                try:
+                    text = _rapiddoc_engine_instance.extract_page_text(
+                        open(self.pdf_path, 'rb').read(),
+                        page_num=page_num,
+                        parse_method='auto',
+                    )
+                    if text and len(text.strip()) > 10:
+                        logging.info(f"Page {page_num + 1}: RapidDoc extracted {len(text)} chars")
+                        return text
+                except Exception as e:
+                    logging.warning(f"Page {page_num + 1}: RapidDoc extraction failed: {e}")
+            # Fallback to plain RapidOCR
             if OCR_AVAILABLE:
                 text = self._extract_via_ocr(page, ocr_language)
                 if text and len(text.strip()) > 10:
@@ -442,6 +474,523 @@ class PDFProcessor:
         
         img_bytes = pix.tobytes("png")
         return img_bytes, pix.width, pix.height
+    
+    # ------------------------------------------------------------------
+    # Markdown element parser for RapidDoc output
+    # ------------------------------------------------------------------
+    
+    @staticmethod
+    def _parse_rapiddoc_markdown(md_text: str) -> List[Dict[str, Any]]:
+        """
+        Parse RapidDoc's Markdown output into structured elements.
+        
+        Each element is a dict with:
+        - type: 'heading', 'paragraph', 'table', 'empty'
+        - level: heading level (1-6) for headings, 0 for others
+        - text: the text content (Markdown markers stripped)
+        - raw: original Markdown text
+        
+        Returns:
+            List of elements in document order
+        """
+        elements = []
+        lines = md_text.split('\n')
+        current_paragraph: List[str] = []
+        in_table = False
+        table_lines: List[str] = []
+        
+        def flush_paragraph():
+            nonlocal current_paragraph
+            if current_paragraph:
+                text = ' '.join(current_paragraph).strip()
+                if text:
+                    elements.append({
+                        'type': 'paragraph',
+                        'level': 0,
+                        'text': text,
+                        'raw': '\n'.join(current_paragraph),
+                    })
+                current_paragraph = []
+        
+        def flush_table():
+            nonlocal table_lines, in_table
+            if table_lines:
+                elements.append({
+                    'type': 'table',
+                    'level': 0,
+                    'text': '\n'.join(table_lines),
+                    'raw': '\n'.join(table_lines),
+                })
+                table_lines = []
+            in_table = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Empty line: flush paragraph
+            if not stripped:
+                if in_table:
+                    flush_table()
+                flush_paragraph()
+                continue
+            
+            # Table line (starts with |)
+            if stripped.startswith('|'):
+                if not in_table:
+                    flush_paragraph()
+                in_table = True
+                # Skip separator lines like |---|---|
+                if re.match(r'^\|[\s\-:|]+\|$', stripped):
+                    continue
+                table_lines.append(stripped)
+                continue
+            
+            if in_table:
+                flush_table()
+            
+            # Heading
+            heading_match = re.match(r'^(#{1,6})\s+(.+)', stripped)
+            if heading_match:
+                flush_paragraph()
+                level = len(heading_match.group(1))
+                text = heading_match.group(2).strip()
+                elements.append({
+                    'type': 'heading',
+                    'level': level,
+                    'text': text,
+                    'raw': stripped,
+                })
+                continue
+            
+            # Image reference (skip)
+            if stripped.startswith('!['):
+                continue
+            
+            # Regular text line → accumulate into paragraph
+            current_paragraph.append(stripped)
+        
+        # Flush remaining
+        if in_table:
+            flush_table()
+        flush_paragraph()
+        
+        return elements
+    
+    # ------------------------------------------------------------------
+    # RapidDoc-based scanned page translation (structured output)
+    # ------------------------------------------------------------------
+    
+    def _translate_scanned_page_rapiddoc(
+        self,
+        new_doc: pymupdf.Document,
+        page: pymupdf.Page,
+        page_num: int,
+        translator,
+        text_color: Tuple[float, float, float] = (0, 0, 0),
+        ocr_language: str = "en"
+    ) -> pymupdf.Document:
+        """
+        Translate a scanned page using RapidDoc (structured document parsing).
+        
+        Unlike plain RapidOCR, RapidDoc provides:
+        - Heading detection (# / ## / ###) via PP-DocLayoutV2 layout analysis
+        - Table recognition (UNET + SLANET_PLUS)
+        - Reading order restoration
+        - Proper paragraph segmentation
+        
+        Strategy:
+        1. RapidDoc extracts structured Markdown from the page
+        2. Parse Markdown into elements (headings, paragraphs, tables)
+        3. Translate each element preserving its semantic role
+        4. Create clean page with proper typographic hierarchy
+        
+        Args:
+            new_doc: Document to modify
+            page: Original page to translate
+            page_num: Page number (for logging)
+            translator: Translation engine
+            text_color: Color for translated text
+            ocr_language: Language code (for logging)
+            
+        Returns:
+            Document with translated structured content
+        """
+        global _rapiddoc_engine_instance
+        
+        if not RAPIDDOC_AVAILABLE or _rapiddoc_engine_instance is None:
+            logging.warning(f"Page {page_num + 1}: RapidDoc not available, falling back to RapidOCR")
+            return self._translate_scanned_page(
+                new_doc, page, page_num, translator, text_color, ocr_language
+            )
+        
+        try:
+            # ============================================
+            # STEP 1: Read original PDF bytes for RapidDoc
+            # ============================================
+            page_rect = page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            
+            # Read original PDF bytes
+            pdf_bytes = open(self.pdf_path, 'rb').read()
+            
+            logging.info(f"Page {page_num + 1}: Using RapidDoc for structured extraction")
+            
+            # ============================================
+            # STEP 2: Extract structured Markdown via RapidDoc
+            # ============================================
+            md_content, metadata = _rapiddoc_engine_instance.extract_page_markdown(
+                pdf_bytes,
+                page_num=page_num,
+                parse_method='auto',
+                table_enable=True,
+                formula_enable=False,
+            )
+            
+            if not md_content or len(md_content.strip()) < 5:
+                logging.warning(f"Page {page_num + 1}: RapidDoc returned no content, falling back to RapidOCR")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, text_color, ocr_language
+                )
+            
+            logging.info(
+                f"Page {page_num + 1}: RapidDoc extracted {len(md_content)} chars, "
+                f"{metadata['num_elements']} elements in {metadata['elapsed']:.1f}s"
+            )
+            
+            # ============================================
+            # STEP 3: Parse Markdown into structured elements
+            # ============================================
+            elements = self._parse_rapiddoc_markdown(md_content)
+            
+            if not elements:
+                logging.warning(f"Page {page_num + 1}: No elements parsed from RapidDoc output")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, text_color, ocr_language
+                )
+            
+            logging.info(
+                f"Page {page_num + 1}: Parsed {len(elements)} elements "
+                f"({sum(1 for e in elements if e['type'] == 'heading')} headings, "
+                f"{sum(1 for e in elements if e['type'] == 'paragraph')} paragraphs, "
+                f"{sum(1 for e in elements if e['type'] == 'table')} tables)"
+            )
+            
+            # ============================================
+            # STEP 4: Translate each element
+            # ============================================
+            translated_elements = []
+            for elem in elements:
+                if elem['type'] == 'table':
+                    # For tables: translate cell-by-cell
+                    translated_table = self._translate_table_element(elem, translator)
+                    translated_elements.append(translated_table)
+                elif elem['text'] and len(elem['text'].strip()) >= 2:
+                    try:
+                        translated = translator.translate(elem['text'])
+                        if translated and translated.strip():
+                            translated_elements.append({
+                                **elem,
+                                'text': translated.strip(),
+                            })
+                        else:
+                            translated_elements.append(elem)
+                    except Exception as e:
+                        logging.warning(f"Translation failed for element: {e}")
+                        translated_elements.append(elem)
+                else:
+                    translated_elements.append(elem)
+            
+            logging.info(f"Page {page_num + 1}: Translated {len(translated_elements)} elements")
+            
+            # ============================================
+            # STEP 5: Render translated elements on clean page
+            # ============================================
+            new_page = new_doc[0]
+            
+            # Clear everything — draw white rectangle over entire page
+            new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
+            
+            # Page margins
+            margin_left = max(36, page_width * 0.06)
+            margin_right = max(36, page_width * 0.06)
+            margin_top = max(45, page_height * 0.05)
+            margin_bottom = max(45, page_height * 0.05)
+            
+            # Text area
+            text_x0 = margin_left
+            text_x1 = page_width - margin_right
+            text_width = text_x1 - text_x0
+            
+            if text_width < 100:
+                text_x0 = 20
+                text_x1 = page_width - 20
+                text_width = text_x1 - text_x0
+            
+            # Base font sizing — adaptive based on page size
+            # Standard A4 is 595 wide, typical body text is 10-11pt
+            body_font_size = max(8.5, min(11, text_width / 48))
+            
+            # Heading sizes
+            heading_sizes = {
+                1: body_font_size * 1.6,   # ~17.6pt for main title
+                2: body_font_size * 1.35,  # ~14.9pt for sections
+                3: body_font_size * 1.15,  # ~12.7pt for subsections
+                4: body_font_size * 1.05,  # ~11.6pt
+                5: body_font_size,         # same as body
+                6: body_font_size,
+            }
+            
+            current_y = margin_top
+            total_inserted = 0
+            body_paragraph_gap = body_font_size * 0.7  # Gap between paragraphs
+            heading_gap_before = body_font_size * 1.2  # Gap before headings
+            heading_gap_after = body_font_size * 0.5   # Gap after headings
+            
+            for elem in translated_elements:
+                if current_y >= page_height - margin_bottom:
+                    logging.warning(
+                        f"Page {page_num + 1}: Ran out of space, "
+                        f"{len(translated_elements) - total_inserted} elements remaining"
+                    )
+                    break
+                
+                elem_type = elem['type']
+                elem_text = elem['text']
+                
+                if not elem_text or not elem_text.strip():
+                    continue
+                
+                # Determine font size and style based on element type
+                if elem_type == 'heading':
+                    level = elem.get('level', 1)
+                    font_size = heading_sizes.get(level, body_font_size)
+                    is_bold = True
+                    gap_before = heading_gap_before if total_inserted > 0 else 0
+                    gap_after = heading_gap_after
+                    align = 0  # Left-aligned
+                elif elem_type == 'table':
+                    font_size = body_font_size * 0.9
+                    is_bold = False
+                    gap_before = body_paragraph_gap
+                    gap_after = body_paragraph_gap
+                    align = 0
+                else:  # paragraph
+                    font_size = body_font_size
+                    is_bold = False
+                    gap_before = body_paragraph_gap if total_inserted > 0 else 0
+                    gap_after = 0
+                    align = 0
+                
+                current_y += gap_before
+                
+                if current_y >= page_height - margin_bottom:
+                    break
+                
+                # Estimate text height
+                chars_per_line = max(1, int(text_width / (font_size * 0.5)))
+                estimated_lines = max(1, len(elem_text) / chars_per_line + 1)
+                estimated_height = estimated_lines * font_size * 1.3
+                
+                # Available space
+                available_height = page_height - margin_bottom - current_y
+                box_height = min(estimated_height * 1.5, available_height)
+                
+                if box_height < font_size * 1.5:
+                    break  # Not enough space
+                
+                text_rect = pymupdf.Rect(text_x0, current_y, text_x1, current_y + box_height)
+                
+                try:
+                    if elem_type == 'table':
+                        # Tables: use HTML rendering for proper grid
+                        table_html = self._render_table_as_html(elem_text, font_size, text_color)
+                        css = f"""* {{
+                            font-family: Helvetica, Arial, sans-serif;
+                            font-size: {font_size}pt;
+                            color: rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)});
+                            line-height: 1.3;
+                            padding: 0;
+                            margin: 0;
+                        }}
+                        table {{ border-collapse: collapse; width: 100%; }}
+                        td, th {{ border: 1px solid #ccc; padding: 4px 6px; text-align: left; }}
+                        th {{ font-weight: bold; background-color: #f5f5f5; }}
+                        """
+                        result = new_page.insert_htmlbox(text_rect, table_html, css=css, scale_low=0.5)
+                        if result[0] < 0:
+                            # Didn't fit, try with actual content
+                            excess = new_page.insert_textbox(
+                                text_rect, elem_text,
+                                fontsize=font_size, fontname="helv",
+                                color=text_color, align=align,
+                            )
+                    elif elem_type == 'heading':
+                        # Headings: use HTML for bold rendering
+                        heading_html = f"<b>{_escape_html(elem_text)}</b>"
+                        css_color = f"rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)})"
+                        css = f"""* {{
+                            font-family: Helvetica, Arial, sans-serif;
+                            font-size: {font_size}pt;
+                            color: {css_color};
+                            font-weight: bold;
+                            line-height: 1.2;
+                            padding: 0;
+                            margin: 0;
+                        }}
+                        b {{ font-weight: bold; }}
+                        """
+                        result = new_page.insert_htmlbox(text_rect, heading_html, css=css, scale_low=0.6)
+                        if result[0] >= 0:
+                            actual_height = box_height - result[0] if result[0] > 0 else font_size * 1.3
+                        else:
+                            actual_height = font_size * 1.3
+                    else:
+                        # Paragraphs: use textbox for clean rendering
+                        excess = new_page.insert_textbox(
+                            text_rect,
+                            elem_text,
+                            fontsize=font_size,
+                            fontname="helv",
+                            color=text_color,
+                            align=align,
+                        )
+                        
+                        if excess < 0:
+                            # Text didn't fit — try smaller font
+                            smaller_font = max(7, font_size * 0.8)
+                            expanded_rect = pymupdf.Rect(
+                                text_x0, current_y, text_x1,
+                                current_y + box_height * 1.5
+                            )
+                            excess = new_page.insert_textbox(
+                                expanded_rect, elem_text,
+                                fontsize=smaller_font, fontname="helv",
+                                color=text_color, align=align,
+                            )
+                            actual_height = box_height * 1.5 if excess >= 0 else box_height
+                        else:
+                            actual_height = box_height - excess if excess > 0 else box_height
+                    
+                    # Calculate actual height used
+                    if elem_type == 'table':
+                        actual_height = box_height  # Tables use full height
+                    elif elem_type != 'heading':
+                        pass  # Already calculated above
+                    
+                    current_y += actual_height + gap_after
+                    total_inserted += 1
+                    
+                except Exception as e:
+                    logging.debug(f"Failed to insert {elem_type} element: {e}")
+                    current_y += font_size * 2  # Skip space and continue
+            
+            logging.info(
+                f"Page {page_num + 1}: RapidDoc clean page created with "
+                f"{total_inserted} translated elements"
+            )
+            return new_doc
+            
+        except Exception as e:
+            capture_exception(e, context={
+                "operation": "translate_scanned_page_rapiddoc",
+                "page_num": page_num,
+            }, tags={"component": "pdf_processor"})
+            logging.error(
+                f"Page {page_num + 1}: RapidDoc translation failed: {e}, "
+                f"falling back to RapidOCR", exc_info=True
+            )
+            # Fallback to plain RapidOCR
+            return self._translate_scanned_page(
+                new_doc, page, page_num, translator, text_color, ocr_language
+            )
+    
+    def _translate_table_element(
+        self, elem: Dict[str, Any], translator
+    ) -> Dict[str, Any]:
+        """
+        Translate a table element cell-by-cell.
+        
+        Parses Markdown table lines (|col1|col2|...) and translates
+        each cell individually to preserve table structure.
+        """
+        lines = elem['text'].strip().split('\n')
+        translated_lines = []
+        
+        for line in lines:
+            if not line.strip().startswith('|'):
+                translated_lines.append(line)
+                continue
+            
+            cells = [c.strip() for c in line.split('|')]
+            # Remove empty first/last from leading/trailing |
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+            
+            translated_cells = []
+            for cell in cells:
+                if cell and len(cell.strip()) >= 2:
+                    try:
+                        translated = translator.translate(cell.strip())
+                        translated_cells.append(translated or cell)
+                    except Exception:
+                        translated_cells.append(cell)
+                else:
+                    translated_cells.append(cell)
+            
+            translated_lines.append('| ' + ' | '.join(translated_cells) + ' |')
+        
+        return {
+            **elem,
+            'text': '\n'.join(translated_lines),
+        }
+    
+    @staticmethod
+    def _render_table_as_html(
+        table_text: str,
+        font_size: float,
+        text_color: Tuple[float, float, float]
+    ) -> str:
+        """
+        Convert a Markdown-style table to HTML for PDF rendering.
+        
+        Args:
+            table_text: Pipe-separated table text (|col1|col2|...)
+            font_size: Base font size
+            text_color: Text color tuple
+            
+        Returns:
+            HTML string with <table> structure
+        """
+        lines = table_text.strip().split('\n')
+        if not lines:
+            return f"<p>{table_text}</p>"
+        
+        html_parts = ['<table>']
+        
+        for i, line in enumerate(lines):
+            if not line.strip().startswith('|'):
+                continue
+            
+            cells = [c.strip() for c in line.split('|')]
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+            
+            if not cells:
+                continue
+            
+            tag = 'th' if i == 0 else 'td'
+            html_parts.append('<tr>')
+            for cell in cells:
+                html_parts.append(f'<{tag}>{_escape_html(cell)}</{tag}>')
+            html_parts.append('</tr>')
+        
+        html_parts.append('</table>')
+        return '\n'.join(html_parts)
     
     def _translate_scanned_page(
         self,
@@ -705,11 +1254,20 @@ class PDFProcessor:
         is_scanned, scan_reason = self._is_likely_scanned_page(page)
         
         if is_scanned:
-            logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason}), using OCR translation mode")
-            return self._translate_scanned_page(
-                new_doc, page, page_num, translator, 
-                text_color, ocr_language
-            )
+            logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason})")
+            # Prefer RapidDoc for structured output (headings, tables, reading order)
+            if RAPIDDOC_AVAILABLE:
+                logging.info(f"Page {page_num + 1}: Using RapidDoc for structured OCR translation")
+                return self._translate_scanned_page_rapiddoc(
+                    new_doc, page, page_num, translator,
+                    text_color, ocr_language
+                )
+            else:
+                logging.info(f"Page {page_num + 1}: Using RapidOCR translation mode (RapidDoc not available)")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, 
+                    text_color, ocr_language
+                )
         
         text_dict = page.get_text("dict")
         

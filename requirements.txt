@@ -18,6 +18,13 @@ sacremoses>=0.1.0
 rapidocr>=3.6.0
 onnxruntime>=1.18.0
 
+# Document parsing: RapidDoc (layout + OCR + table → Markdown)
+# PP-DocLayoutV2 layout analysis + table recognition
+# Note: installed with --no-deps to avoid rapidocr version conflict
+rapid-doc>=0.7.0
+openvino>=2024.6.0,<=2025.4.0
+fast-langdetect>=0.2.3,<0.3.0
+
 # Qt6 GUI Framework
 PySide6>=6.6.0
 
