@@ -658,6 +658,20 @@ class PDFProcessor:
                 f"{metadata['num_elements']} elements in {metadata['elapsed']:.1f}s"
             )
             
+            # Detect multi-column layout from block bounding boxes
+            detected_columns = 1
+            col_x_ranges: list = []
+            if metadata.get('block_bboxes'):
+                detected_columns, col_x_ranges = _rapiddoc_engine_instance.detect_column_count(
+                    metadata['block_bboxes'],
+                    metadata.get('page_size'),
+                )
+                if detected_columns > 1:
+                    logging.info(
+                        f"Page {page_num + 1}: Detected {detected_columns}-column layout "
+                        f"(x-ranges: {[(f'{x0:.0f}-{x1:.0f}') for x0, x1 in col_x_ranges]})"
+                    )
+            
             # ============================================
             # STEP 3: Parse Markdown into structured elements
             # ============================================
@@ -854,35 +868,93 @@ class PDFProcessor:
             }}
             """
             
-            # Render everything in a single call with auto-scaling
-            # scale_low=0 means PyMuPDF will shrink content as much as
-            # needed to fit; minimum readable is ~0.3 of original
-            result = new_page.insert_htmlbox(
-                text_rect, full_html, css=css, scale_low=0
-            )
-            spare_height, scale = result
-            
             total_inserted = len(translated_elements)
             
-            if spare_height < 0:
-                # Even with unlimited scaling, content didn't fit
-                # (this should be very rare with scale_low=0)
-                logging.warning(
-                    f"Page {page_num + 1}: Content could not fit even with "
-                    f"full scaling (scale={scale:.2f})"
-                )
-            elif scale < 1.0:
+            if detected_columns > 1:
+                # ── MULTI-COLUMN: use Story API with multiple rects ──
+                # PyMuPDF's insert_htmlbox ignores CSS column-count.
+                # The correct approach is to create a Story and flow
+                # content across separate column rectangles.
+                
+                if col_x_ranges:
+                    # Use actual column positions from layout detection
+                    col_rects = []
+                    for cx0, cx1 in col_x_ranges:
+                        col_rects.append(pymupdf.Rect(
+                            cx0, text_rect.y0,
+                            cx1, text_rect.y1
+                        ))
+                else:
+                    # Fallback: evenly divide text_rect
+                    col_gap = body_font_size * 1.5
+                    col_w = (text_rect.width - col_gap * (detected_columns - 1)) / detected_columns
+                    col_rects = []
+                    for ci in range(detected_columns):
+                        x0 = text_rect.x0 + ci * (col_w + col_gap)
+                        col_rects.append(pymupdf.Rect(
+                            x0, text_rect.y0,
+                            x0 + col_w, text_rect.y1
+                        ))
+                
+                mediabox = pymupdf.Rect(0, 0, page_width, page_height)
+                
+                story = pymupdf.Story(html=full_html, user_css=css)
+                
+                def rectfn(rect_num, filled):
+                    if rect_num < detected_columns:
+                        # First rect starts a new page; rest stay on same page
+                        mb = mediabox if rect_num == 0 else None
+                        return (mb, col_rects[rect_num], None)
+                    return (None, None, None)  # stop — single page only
+                
+                temp_doc = story.write_with_links(rectfn)
+                
+                # Overlay the temp page onto our output page
+                new_page.show_pdf_page(page_rect, temp_doc, 0)
+                
+                # Log column layout info
+                temp_page = temp_doc[0]
+                temp_words = temp_page.get_text('words')
+                mid_x = page_width / 2
+                left_w = sum(1 for w in temp_words if w[2] < mid_x)
+                right_w = sum(1 for w in temp_words if w[0] > mid_x)
+                
                 logging.info(
-                    f"Page {page_num + 1}: Content auto-scaled to "
-                    f"{scale:.0%} to fit page "
-                    f"(spare={spare_height:.0f}pt)"
+                    f"Page {page_num + 1}: RapidDoc {detected_columns}-column layout "
+                    f"({left_w} words left, {right_w} words right, "
+                    f"{total_inserted} elements)"
                 )
-            
-            logging.info(
-                f"Page {page_num + 1}: RapidDoc clean page created with "
-                f"{total_inserted} translated elements "
-                f"(scale={scale:.0%}, spare_height={spare_height:.0f}pt)"
-            )
+                
+                try:
+                    temp_doc.close()
+                except Exception:
+                    pass
+            else:
+                # ── SINGLE-COLUMN: use insert_htmlbox with auto-scaling ──
+                # scale_low=0 means PyMuPDF will shrink content as much as
+                # needed to fit; minimum readable is ~0.3 of original
+                result = new_page.insert_htmlbox(
+                    text_rect, full_html, css=css, scale_low=0
+                )
+                spare_height, scale = result
+                
+                if spare_height < 0:
+                    logging.warning(
+                        f"Page {page_num + 1}: Content could not fit even with "
+                        f"full scaling (scale={scale:.2f})"
+                    )
+                elif scale < 1.0:
+                    logging.info(
+                        f"Page {page_num + 1}: Content auto-scaled to "
+                        f"{scale:.0%} to fit page "
+                        f"(spare={spare_height:.0f}pt)"
+                    )
+                
+                logging.info(
+                    f"Page {page_num + 1}: RapidDoc clean page created with "
+                    f"{total_inserted} translated elements "
+                    f"(scale={scale:.0%}, spare_height={spare_height:.0f}pt)"
+                )
             return new_doc
             
         except Exception as e:
