@@ -20,8 +20,10 @@ onnxruntime>=1.18.0
 
 # Document parsing: RapidDoc (layout + OCR + table → Markdown)
 # PP-DocLayoutV2 layout analysis + table recognition
-# Note: installed with --no-deps to avoid rapidocr version conflict
-rapid-doc>=0.7.0
+# IMPORTANT: install with --no-deps to avoid rapidocr version conflict
+# In CI/CD, this is handled separately in the workflow
+# Locally: pip install --no-deps rapid-doc>=0.7.0
+# rapid-doc>=0.7.0  # see workflow for --no-deps install
 openvino>=2024.6.0,<=2025.4.0
 fast-langdetect>=0.2.3,<0.3.0
 
