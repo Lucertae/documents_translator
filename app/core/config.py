@@ -4,11 +4,11 @@ Configuration constants for PDF processing and OCR.
 This module centralizes all tunable parameters and thresholds
 to improve maintainability and allow easy experimentation.
 
-PaddleOCR Configuration (v3.3.3 with PP-OCRv5):
-- Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug on CPU)
-- PP-OCRv5 provides best accuracy for scanned documents
-- Supports 80+ languages: en, it, fr, de, es, pt, zh, ja, ko, ar, ru, etc.
-- use_textline_orientation=True enables automatic text orientation detection
+OCR Engine: RapidOCR v3 (ONNX Runtime)
+- PP-OCRv5 MOBILE (detection) + PP-OCRv4 LATIN SERVER (recognition)
+- ~1-3 secondi per pagina su CPU
+- Supporto multilingue (lingue latine: EN, IT, FR, DE, ES...)
+- Configurazione in app/core/rapid_ocr.py
 """
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -20,11 +20,10 @@ from typing import Dict, Tuple
 
 @dataclass(frozen=True)
 class OCRConfig:
-    """Configuration for PaddleOCR engine (PP-OCRv5).
+    """Configuration for OCR engine (RapidOCR).
     
-    Recommended versions:
-    - PaddlePaddle: 3.2.x (3.3.0 has ONEDNN bug on CPU)
-    - PaddleOCR: 3.3.3 with PP-OCRv5 models
+    RapidOCR engine parameters are in rapid_ocr.py._build_engine_params().
+    These thresholds control the PDF processor's decision logic around OCR.
     """
     
     # Recognition thresholds  
@@ -125,17 +124,6 @@ SERIF_FONT_PATTERNS = [
 # ============================================
 # Language Mappings
 # ============================================
-
-# PaddleOCR language codes
-PADDLEOCR_LANGUAGES: Dict[str, str] = {
-    "Italiano": "it",
-    "English": "en",
-    "Español": "es",
-    "Français": "fr",
-    "Deutsch": "de",
-    "Português": "pt",
-    "Nederlands": "nl",
-}
 
 # OPUS-MT model mapping
 OPUS_MODEL_MAP: Dict[Tuple[str, str], str] = {

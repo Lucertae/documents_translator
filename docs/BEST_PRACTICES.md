@@ -1,75 +1,95 @@
 # Best Practices per OCR e Traduzione
 
-## PaddleOCR v3.3+ Best Practices
+## GLM-OCR Best Practices
 
-### 1. Configurazione Ottimale per Documenti Scansionati
+### 1. Installazione e Setup
 
-```python
-from paddleocr import PaddleOCR
+GLM-OCR usa Ollama come backend. Per installare:
 
-ocr = PaddleOCR(
-    # Modelli raccomandati per documenti EN
-    det_model_name="PP-OCRv5_server_det",  # Detection più accurato
-    rec_model_name="en_PP-OCRv5_mobile_rec",  # Recognition per EN
-    
-    # Preprocessing documento
-    use_doc_orientation_classify=True,  # Correggi orientamento
-    use_doc_unwarping=True,  # Correggi distorsioni
-    use_textline_orientation=True,  # Orientamento linee di testo
-    
-    # Soglie di detection
-    text_det_thresh=0.3,  # Lower = più sensibile (default 0.5)
-    text_det_box_thresh=0.5,  # Threshold bounding box
-    
-    # Performance
-    lang="en",
-)
+```bash
+# 1. Installa Ollama
+# macOS/Linux
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Windows - scarica da https://ollama.com/download
+
+# 2. Avvia il servizio Ollama
+ollama serve
+
+# 3. Pull del modello GLM-OCR (2.2GB)
+ollama pull glm-ocr
 ```
 
-### 2. Parametri Critici
-
-| Parametro | Valore Consigliato | Note |
-|-----------|-------------------|------|
-| `text_det_thresh` | 0.3-0.5 | Più basso = più testo rilevato |
-| `text_det_box_thresh` | 0.5-0.6 | Qualità bounding box |
-| `use_doc_orientation_classify` | True | Per scansioni ruotate |
-| `use_doc_unwarping` | True | Per documenti storti |
-
-### 3. Risoluzione Immagine
+### 2. Utilizzo Base
 
 ```python
-# Scala ottimale per OCR
-ocr_scale = 2.0  # 2x la risoluzione originale
+from app.core.glm_ocr import GlmOcrEngine, check_ollama_status
 
-mat = fitz.Matrix(ocr_scale, ocr_scale)
-pix = page.get_pixmap(matrix=mat, alpha=False)
+# Verifica stato
+is_ready, message = check_ollama_status()
+print(f"GLM-OCR: {message}")
+
+# Uso basico
+engine = GlmOcrEngine()
+text, confidence = engine.recognize_text(image_bytes, mode="text")
 ```
 
-- **Minimo**: 150 DPI
+### 3. Modalità di Riconoscimento
+
+| Modalità | Uso | Prompt |
+|----------|-----|--------|
+| `text` | Testo normale | "Text Recognition:" |
+| `table` | Tabelle | "Table Recognition:" |
+| `figure` | Figure/diagrammi | "Figure Recognition:" |
+
+```python
+# Riconoscimento testo normale
+text, conf = engine.recognize_text(image_bytes, mode="text")
+
+# Riconoscimento tabelle
+table_text, conf = engine.recognize_text(image_bytes, mode="table")
+
+# Riconoscimento automatico (rileva tabelle)
+text = engine.recognize_document_page(image_bytes, detect_tables=True)
+```
+
+### 4. Risoluzione Immagine
+
 - **Ottimale**: 300 DPI (scale 2.0 per PDF standard a 72 DPI)
-- **Massimo utile**: 400 DPI (oltre non migliora, solo rallenta)
+- GLM-OCR gestisce automaticamente orientamento e dewarping
+- Usa PNG per massima qualità
 
-### 4. Post-processing OCR
+```python
+import pymupdf
 
-Errori comuni da correggere con pattern matching:
+# Scala ottimale per OCR
+pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0))
+img_data = pix.tobytes("png")
+```
+
+### 5. Post-processing OCR
+
+Il post-processing in `ocr_utils.py` corregge errori comuni:
+
 - I/l/1 confusione (es. "Mimakl" → "Mimaki")
 - O/0 confusione (es. "Auth0rized" → "Authorized")
-- rn/m confusione (es. "cornpany" → "company")
-- Ligature non risolte (ﬁ, ﬂ, ﬀ)
-
-### 5. Layout Detection per Multi-Colonna
+- Normalizzazione spazi e punteggiatura
+- Rimozione artefatti di pagina
 
 ```python
-from paddleocr import LayoutDetection
+from app.core.ocr_utils import clean_ocr_text, post_process_ocr_text
 
-layout = LayoutDetection()
-result = layout.predict(image)
-
-# Estrai colonne
-text_boxes = [b for b in result[0]['boxes'] 
-              if b['label'] in ['text', 'title'] 
-              and b['score'] > 0.5]
+# Applica correzioni OCR
+text = clean_ocr_text(raw_text)
+text = post_process_ocr_text(text)
 ```
+
+### 6. Performance
+
+GLM-OCR (0.9B parametri) è ottimizzato per:
+- Inferenza veloce su CPU
+- Basso consumo di memoria (~2.2GB)
+- Alta precisione (#1 su OmniDocBench V1.5 con 94.62)
 
 ---
 
@@ -82,7 +102,6 @@ import re
 
 def segment_sentences(text):
     """Segmenta correttamente per traduzione."""
-    # Pattern che preserva abbreviazioni
     pattern = r'(?<=[.!?])\s+(?=[A-Z])'
     sentences = re.split(pattern, text)
     return [s.strip() for s in sentences if s.strip()]
@@ -112,12 +131,7 @@ def normalize_for_opus(text):
 ### 3. Protezione Termini
 
 ```python
-# Termini da NON tradurre
-PRESERVE_TERMS = [
-    "Mimaki", "MIMAKI",
-    "Trotec", "Bompan",
-    "URL", "PDF", "ISO",
-]
+PRESERVE_TERMS = ["Mimaki", "MIMAKI", "Trotec", "URL", "PDF", "ISO"]
 
 def protect_terms(text, terms):
     """Proteggi termini dalla traduzione."""
@@ -128,12 +142,6 @@ def protect_terms(text, terms):
             text = text.replace(term, placeholder)
             placeholders[placeholder] = term
     return text, placeholders
-
-def restore_terms(text, placeholders):
-    """Ripristina termini dopo traduzione."""
-    for placeholder, term in placeholders.items():
-        text = text.replace(placeholder, term)
-    return text
 ```
 
 ### 4. Lunghezza Chunk Ottimale
@@ -169,7 +177,7 @@ def chunk_text(text, max_chars=1500):
 
 ### 1. Metriche OCR
 - **Confidence media** > 0.85 = buona qualità
-- **Confidence minima** > 0.5 = accettabile
+- **Lunghezza output** ragionevole per il documento
 - **Termini attesi** trovati = 100%
 
 ### 2. Metriche Traduzione
@@ -184,14 +192,30 @@ def chunk_text(text, max_chars=1500):
 
 ---
 
-## Checklist Iterazione
+## Troubleshooting
 
-Prima di ogni modifica:
-- [ ] Test baseline su documento target
-- [ ] Cattura metriche OCR/Translation/Format
+### Ollama non risponde
 
-Dopo ogni modifica:
-- [ ] Ri-test su documento target
-- [ ] Confronto metriche con baseline
-- [ ] Test regressione su altri documenti
-- [ ] Solo se tutti ok → commit modifica
+```bash
+# Verifica che il servizio sia attivo
+curl http://localhost:11434/api/tags
+
+# Riavvia se necessario
+ollama serve
+```
+
+### Modello non trovato
+
+```bash
+# Pull del modello
+ollama pull glm-ocr
+
+# Verifica modelli installati
+ollama list
+```
+
+### OCR lento
+
+- Riduci la risoluzione (scale 1.5 invece di 2.0)
+- Usa la versione quantizzata: `ollama pull glm-ocr:q8_0`
+- Verifica che nessun altro processo usi Ollama

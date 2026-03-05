@@ -1,17 +1,17 @@
 """
-PDF processing module - PaddleOCR Edition
+PDF processing module - RapidOCR Edition
 Handles PDF loading, text extraction, OCR, and manipulation with superior quality.
 
 SPAN-LEVEL FORMATTING PRESERVATION:
-This module now preserves formatting at the span level, not just line level.
-This means bold, italic, color, and size are tracked per-segment and
+This module preserves formatting at the span level, not just line level.
+Bold, italic, color, and size are tracked per-segment and
 intelligently mapped to the translated text using proportional allocation.
 
-PaddleOCR Configuration (v3.3.3 with PP-OCRv5):
-- Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug on CPU)
-- PP-OCRv5 provides best accuracy for scanned documents
-- Supports 80+ languages via 'lang' parameter
-- use_textline_orientation=True enables automatic text orientation detection
+OCR Engine: RapidOCR (ONNX Runtime + PP-OCRv4/v5)
+- ~1-3 secondi per pagina su CPU
+- Pipeline: text detection + direction classification + text recognition
+- Modelli PP-OCRv5 (detection) + PP-OCRv4 (recognition EN)
+- Nessun server esterno (tutto in-process)
 """
 import logging
 import math
@@ -24,8 +24,8 @@ import pymupdf
 from PIL import Image
 import numpy as np
 
-# Environment setup for PaddlePaddle CPU (must be before PaddleOCR import)
-os.environ.setdefault('DISABLE_MODEL_SOURCE_CHECK', 'True')
+# System imports
+import sys
 
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
@@ -36,7 +36,6 @@ from .config import (
     DEFAULT_TEXT_QUALITY_CONFIG,
     DEFAULT_SCAN_DETECTION_CONFIG,
     DEFAULT_PARAGRAPH_CONFIG,
-    PADDLEOCR_LANGUAGES,
     LIGATURE_MAP,
     QUOTE_MAP,
     DASH_SPACE_MAP,
@@ -53,7 +52,7 @@ from .format_utils import (
 )
 
 # Import OCR post-processing
-from .ocr_utils import clean_ocr_text, post_process_ocr_text
+from .ocr_utils import post_process_ocr_text
 
 # Import Sentry integration
 from .sentry_integration import capture_exception, add_breadcrumb, set_context
@@ -64,62 +63,48 @@ from .sentry_integration import capture_exception, add_breadcrumb, set_context
 # NOTE: detect_title_or_heading moved to format_utils.py (simplified version)
 
 
-# OCR and Document Analysis imports
+# OCR integration via RapidOCR (ONNX Runtime)
 try:
-    from paddleocr import PaddleOCR, LayoutDetection
-    OCR_AVAILABLE = True
-    LAYOUT_DETECTION_AVAILABLE = True
-except ImportError:
-    try:
-        from paddleocr import PaddleOCR
-        OCR_AVAILABLE = True
-        LAYOUT_DETECTION_AVAILABLE = False
-    except ImportError:
-        OCR_AVAILABLE = False
-        LAYOUT_DETECTION_AVAILABLE = False
-        logging.warning("OCR not available - install paddleocr for scanned PDF support")
+    from .rapid_ocr import RapidOcrEngine, check_ocr_status
+    _ocr_engine_instance = RapidOcrEngine()
+    OCR_AVAILABLE = _ocr_engine_instance.is_available()
+    if not OCR_AVAILABLE:
+        logging.warning("RapidOCR not ready - run: pip install rapidocr onnxruntime")
+except ImportError as e:
+    OCR_AVAILABLE = False
+    _ocr_engine_instance = None
+    logging.warning(f"OCR not available: {e}")
 
-# DocPreprocessor for automatic image correction (rotation, dewarping)
+# RapidDoc integration for structured document parsing (layout + OCR + table)
 try:
-    from paddleocr import DocPreprocessor
-    DOC_PREPROCESSOR_AVAILABLE = True
-except ImportError:
-    DOC_PREPROCESSOR_AVAILABLE = False
-    logging.debug("DocPreprocessor not available - install paddleocr[doc-parser] for better preprocessing")
-
-# PPStructureV3 for advanced document structure analysis
-try:
-    from paddleocr import PPStructureV3
-    PP_STRUCTURE_AVAILABLE = True
-except ImportError:
-    PP_STRUCTURE_AVAILABLE = False
-    logging.debug("PPStructureV3 not available - install paddleocr[doc-parser] for advanced structure analysis")
+    from .rapid_doc_engine import RapidDocEngine, check_rapiddoc_status
+    _rapiddoc_engine_instance = RapidDocEngine()
+    RAPIDDOC_AVAILABLE = _rapiddoc_engine_instance.is_available()
+    if RAPIDDOC_AVAILABLE:
+        logging.info("RapidDoc engine available — structured document parsing enabled")
+    else:
+        logging.info("RapidDoc not available, using plain RapidOCR for scanned pages")
+except ImportError as e:
+    RAPIDDOC_AVAILABLE = False
+    _rapiddoc_engine_instance = None
+    logging.info(f"RapidDoc not available: {e}")
+except Exception as e:
+    RAPIDDOC_AVAILABLE = False
+    _rapiddoc_engine_instance = None
+    logging.warning(f"RapidDoc initialization error: {e}")
 
 
 class PDFProcessor:
     """
-    Professional PDF processor with PaddleOCR (superior to Tesseract).
-    Supports normal PDFs and scanned documents via state-of-the-art OCR.
+    Professional PDF processor with RapidOCR (fast ONNX-based OCR).
+    Supports normal PDFs and scanned documents via RapidOCR.
     
-    Advantages of PaddleOCR:
-    - 3-5x faster than Tesseract
-    - Higher accuracy (~95% vs ~85%)
-    - Better handling of complex layouts
-    - Automatic text detection (finds text regions)
+    RapidOCR Advantages:
+    - ~1-3 sec/page on CPU (vs 5+ min with GLM-OCR)
+    - PP-OCRv4/v5 models via ONNX Runtime
+    - No external server needed (in-process)
+    - Automatic model download (~15 MB)
     """
-    
-    # Singleton PaddleOCR instance (lazy loading)
-    _ocr_engine = None
-    _current_lang = None
-    
-    # Singleton LayoutDetection instance
-    _layout_engine = None
-    
-    # Singleton DocPreprocessor instance
-    _doc_preprocessor = None
-    
-    # Singleton PPStructureV3 instance
-    _pp_structure = None
     
     def __init__(self, pdf_path: str):
         """
@@ -297,7 +282,7 @@ class PDFProcessor:
         
         Args:
             page_num: Page number to extract from
-            ocr_language: Language code for OCR (PaddleOCR format)
+            ocr_language: Language code for OCR (used for logging)
             
         Returns:
             Extracted text with best possible quality
@@ -309,6 +294,20 @@ class PDFProcessor:
         
         if is_scanned:
             logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason}), using OCR directly")
+            # Prefer RapidDoc for structured text extraction
+            if RAPIDDOC_AVAILABLE:
+                try:
+                    text = _rapiddoc_engine_instance.extract_page_text(
+                        open(self.pdf_path, 'rb').read(),
+                        page_num=page_num,
+                        parse_method='auto',
+                    )
+                    if text and len(text.strip()) > 10:
+                        logging.info(f"Page {page_num + 1}: RapidDoc extracted {len(text)} chars")
+                        return text
+                except Exception as e:
+                    logging.warning(f"Page {page_num + 1}: RapidDoc extraction failed: {e}")
+            # Fallback to plain RapidOCR
             if OCR_AVAILABLE:
                 text = self._extract_via_ocr(page, ocr_language)
                 if text and len(text.strip()) > 10:
@@ -410,352 +409,53 @@ class PDFProcessor:
             return " ".join([word[4] for word in words if word[4].strip()])
         return ""
     
-    @classmethod
-    def _get_ocr_engine(cls, language: str):
-        """Get or create PaddleOCR engine (singleton with language caching).
-        
-        Uses PP-OCRv5 models for best accuracy on CPU.
-        Requires PaddlePaddle 3.2.x (3.3.0 has ONEDNN bug).
-        """
-        if cls._ocr_engine is None or cls._current_lang != language:
-            logging.info(f"Initializing PaddleOCR PP-OCRv5 for language: {language}")
-            try:
-                # PaddleOCR 3.3.3 API with PP-OCRv5 (best quality on CPU)
-                cls._ocr_engine = PaddleOCR(
-                    lang=language,
-                    use_textline_orientation=True,  # Auto-detect text orientation
-                )
-                cls._current_lang = language
-                logging.info(f"[OK] PaddleOCR PP-OCRv5 initialized for {language}")
-            except Exception as e:
-                error_msg = str(e)
-                capture_exception(e, context={
-                    "operation": "init_paddleocr",
-                    "language": language,
-                    "error_type": "dependency" if "dependency" in error_msg.lower() else "other",
-                }, tags={"component": "ocr"})
-                logging.error(f"Failed to initialize PaddleOCR: {error_msg}")
-                if "dependency error" in error_msg.lower() or "predictor creation" in error_msg.lower():
-                    logging.error("=" * 60)
-                    logging.error("PaddleOCR DEPENDENCY ERROR - Scanned PDFs not supported")
-                    logging.error("This document appears to be a scanned image.")
-                    logging.error("OCR requires additional Windows dependencies.")
-                    logging.error("")
-                    logging.error("SOLUTION: Use the Python version instead of the EXE:")
-                    logging.error("  1. Install Python 3.11")
-                    logging.error("  2. pip install -r requirements.txt")
-                    logging.error("  3. python app/main_qt.py")
-                    logging.error("=" * 60)
-                cls._ocr_engine = None
-        return cls._ocr_engine
-    
-    @classmethod
-    def _get_layout_engine(cls):
-        """Get or create LayoutDetection engine (singleton)."""
-        if not LAYOUT_DETECTION_AVAILABLE:
-            return None
-        if cls._layout_engine is None:
-            logging.info("Initializing LayoutDetection engine...")
-            try:
-                cls._layout_engine = LayoutDetection()
-                logging.info("[OK] LayoutDetection initialized")
-            except Exception as e:
-                error_msg = str(e)
-                if "dependency error" not in error_msg.lower():
-                    capture_exception(e, context={"operation": "init_layout_detection"}, tags={"component": "ocr"})
-                    logging.error(f"Failed to initialize LayoutDetection: {e}")
-                cls._layout_engine = None
-                cls._layout_engine = None
-        return cls._layout_engine
-    
-    @classmethod
-    def _get_doc_preprocessor(cls):
-        """Get or create DocPreprocessor engine (singleton) for automatic image correction."""
-        if not DOC_PREPROCESSOR_AVAILABLE:
-            return None
-        if cls._doc_preprocessor is None:
-            logging.info("Initializing DocPreprocessor engine...")
-            try:
-                cls._doc_preprocessor = DocPreprocessor()
-                logging.info("[OK] DocPreprocessor initialized")
-            except Exception as e:
-                capture_exception(e, context={"operation": "init_doc_preprocessor"}, tags={"component": "ocr"})
-                logging.error(f"Failed to initialize DocPreprocessor: {e}")
-                cls._doc_preprocessor = None
-        return cls._doc_preprocessor
-    
-    @classmethod
-    def _get_pp_structure(cls):
-        """Get or create PPStructureV3 engine (singleton) for advanced document parsing."""
-        if not PP_STRUCTURE_AVAILABLE:
-            return None
-        if cls._pp_structure is None:
-            logging.info("Initializing PPStructureV3 engine...")
-            try:
-                cls._pp_structure = PPStructureV3()
-                logging.info("[OK] PPStructureV3 initialized")
-            except Exception as e:
-                capture_exception(e, context={"operation": "init_pp_structure"}, tags={"component": "ocr"})
-                logging.error(f"Failed to initialize PPStructureV3: {e}")
-                cls._pp_structure = None
-        return cls._pp_structure
-    
     def _extract_via_ocr(self, page: pymupdf.Page, language: str) -> str:
         """
-        Extract text using PaddleOCR v3+ with intelligent segmentation.
+        Extract text using RapidOCR, con preprocessing robusto.
         
-        Features:
-        - Reading order detection (top-to-bottom, left-to-right)
-        - Paragraph grouping based on vertical distance
-        - Multi-column layout support
-        - Preserves document structure with proper line breaks
+        Lavora direttamente sulla pagina PyMuPDF senza scrivere PDF temporanei.
+        Logga le caratteristiche del PNG preprocessato.
         """
+        global _ocr_engine_instance
+        if _ocr_engine_instance is None:
+            logging.warning("RapidOCR engine not available")
+            return ""
         try:
-            logging.info(f"Attempting PaddleOCR extraction (language: {language})")
+            logging.info(f"RapidOCR extraction (lang={language}) [preprocessing attivo]")
+            from .preprocess_for_ocr import preprocess_page_from_pymupdf, DEFAULT_DPI
             
-            # Convert PDF page to high-resolution image
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0))  # 2x scale for better quality
-            img_data = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_data))
+            # Preprocessa direttamente dalla pagina (no file temporanei)
+            # DPI 300: coerente con max_side_len=3000 dell'engine RapidOCR
+            png_bytes, info = preprocess_page_from_pymupdf(page, dpi=DEFAULT_DPI)
             
-            # Convert to numpy array (PaddleOCR input format)
-            img_array = np.array(img)
-            img_height, img_width = img_array.shape[:2]
+            logging.info(
+                f"PNG per OCR: {info['width']}x{info['height']} px | "
+                f"DPI={info['dpi']} | Mode={info['mode']} | "
+                f"Size={info['file_size_kb']} KB"
+            )
             
-            # Get PaddleOCR engine
-            ocr = self._get_ocr_engine(language)
-            if ocr is None:
-                logging.warning("PaddleOCR engine not available")
-                return ""
+            # Usa RapidOCR per il riconoscimento
+            text = _ocr_engine_instance.recognize_document_page(
+                png_bytes,
+                detect_tables=True
+            )
             
-            # Run OCR with modern API
-            result = ocr.predict(img_array)
+            if text:
+                # post_process_ocr_text include già clean_ocr_text come primo passo
+                text = post_process_ocr_text(text)
+                logging.info(f"RapidOCR OK: {len(text)} chars")
+                return text
             
-            # Extract text from result (PaddleOCR v3+ format)
-            if result and len(result) > 0:
-                ocr_result = result[0]
-                
-                # Get texts, scores, and polygons
-                texts = ocr_result.get('rec_texts', [])
-                scores = ocr_result.get('rec_scores', [])
-                polys = ocr_result.get('rec_polys', [])
-                
-                # Build text regions with position data
-                MIN_CONFIDENCE = 0.5
-                text_regions = []
-                
-                for i, (text, score, poly) in enumerate(zip(texts, scores, polys)):
-                    if score >= MIN_CONFIDENCE and text.strip():
-                        # Extract bounding box from polygon
-                        # poly is typically [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                        try:
-                            if hasattr(poly, 'tolist'):
-                                poly = poly.tolist()
-                            xs = [p[0] for p in poly]
-                            ys = [p[1] for p in poly]
-                            bbox = {
-                                'x0': min(xs),
-                                'y0': min(ys),
-                                'x1': max(xs),
-                                'y1': max(ys),
-                                'center_x': sum(xs) / len(xs),
-                                'center_y': sum(ys) / len(ys),
-                                'height': max(ys) - min(ys),
-                                'width': max(xs) - min(xs),
-                            }
-                            text_regions.append({
-                                'text': text.strip(),
-                                'score': score,
-                                'bbox': bbox,
-                            })
-                        except Exception as e:
-                            logging.debug(f"Failed to parse polygon {i}: {e}")
-                            # Still include text without position
-                            text_regions.append({
-                                'text': text.strip(),
-                                'score': score,
-                                'bbox': None,
-                            })
-                
-                if not text_regions:
-                    logging.warning("PaddleOCR returned no valid text regions")
-                    return ""
-                
-                # Apply intelligent segmentation
-                extracted_text = self._segment_ocr_text(text_regions, img_width, img_height)
-                logging.info(f"PaddleOCR successful: {len(extracted_text)} chars, {len(text_regions)} text regions")
-                return extracted_text
-            
-            logging.warning("PaddleOCR returned no results")
+            logging.warning("RapidOCR returned no text")
+            return ""
             
         except Exception as e:
-            capture_exception(e, context={"operation": "ocr_extract"}, tags={"component": "ocr"})
-            logging.warning(f"PaddleOCR failed: {e}")
-        return ""
-    
-    def _segment_ocr_text(
-        self, 
-        text_regions: List[dict], 
-        img_width: int, 
-        img_height: int
-    ) -> str:
-        """
-        Intelligent text segmentation for OCR results.
-        
-        Algorithm:
-        1. Detect columns by analyzing x-position distribution
-        2. Sort text by reading order (column-aware)
-        3. Group into paragraphs by vertical proximity
-        4. Join with appropriate separators
-        
-        Args:
-            text_regions: List of {'text': str, 'score': float, 'bbox': dict}
-            img_width: Image width for column detection
-            img_height: Image height for spacing calculations
-            
-        Returns:
-            Properly segmented text with paragraph breaks
-        """
-        if not text_regions:
+            capture_exception(e, context={
+                "operation": "rapidocr_extract",
+                "language": language,
+            }, tags={"component": "ocr"})
+            logging.warning(f"RapidOCR failed: {e}")
             return ""
-        
-        # Separate regions with and without position data
-        positioned = [r for r in text_regions if r['bbox'] is not None]
-        unpositioned = [r for r in text_regions if r['bbox'] is None]
-        
-        if not positioned:
-            # No position data, just join texts
-            return ' '.join(r['text'] for r in text_regions)
-        
-        # Step 1: Detect columns
-        columns = self._detect_columns(positioned, img_width)
-        logging.debug(f"Detected {len(columns)} column(s)")
-        
-        # Step 2: Process each column
-        all_paragraphs = []
-        
-        for col_idx, column_regions in enumerate(columns):
-            # Sort by vertical position (top to bottom)
-            column_regions.sort(key=lambda r: r['bbox']['y0'])
-            
-            # Step 3: Group into paragraphs
-            paragraphs = self._group_into_paragraphs(column_regions)
-            all_paragraphs.extend(paragraphs)
-        
-        # Step 4: Build final text with OCR post-processing
-        result_parts = []
-        for para in all_paragraphs:
-            para_text = ' '.join(para)
-            if para_text.strip():
-                # Apply OCR post-processing to fix common errors (MimakI -> Mimaki, etc.)
-                para_text = clean_ocr_text(para_text.strip())
-                result_parts.append(para_text)
-        
-        # Add unpositioned text at the end
-        if unpositioned:
-            unpositioned_text = ' '.join(r['text'] for r in unpositioned)
-            unpositioned_text = clean_ocr_text(unpositioned_text)
-            result_parts.append(unpositioned_text)
-        
-        # Join paragraphs with double newline
-        return '\n\n'.join(result_parts)
-    
-    def _detect_columns(
-        self, 
-        text_regions: List[dict], 
-        img_width: int
-    ) -> List[List[dict]]:
-        """
-        Detect column layout by analyzing x-position distribution.
-        
-        Uses gap analysis to find column boundaries.
-        """
-        if not text_regions or len(text_regions) < 3:
-            return [text_regions]
-        
-        # Get all center x positions
-        x_positions = sorted(r['bbox']['center_x'] for r in text_regions)
-        
-        # Find large gaps that might indicate column boundaries
-        # A gap larger than 15% of page width suggests columns
-        min_gap = img_width * 0.15
-        
-        gaps = []
-        for i in range(len(x_positions) - 1):
-            gap = x_positions[i + 1] - x_positions[i]
-            if gap > min_gap:
-                # Store gap position (midpoint)
-                gaps.append((x_positions[i] + x_positions[i + 1]) / 2)
-        
-        if not gaps:
-            # Single column layout
-            return [text_regions]
-        
-        # Sort gaps and use them as column boundaries
-        gaps.sort()
-        
-        # Assign regions to columns
-        boundaries = [0] + gaps + [img_width]
-        columns = [[] for _ in range(len(boundaries) - 1)]
-        
-        for region in text_regions:
-            center_x = region['bbox']['center_x']
-            for col_idx in range(len(boundaries) - 1):
-                if boundaries[col_idx] <= center_x < boundaries[col_idx + 1]:
-                    columns[col_idx].append(region)
-                    break
-        
-        # Remove empty columns
-        columns = [col for col in columns if col]
-        
-        return columns if columns else [text_regions]
-    
-    def _group_into_paragraphs(
-        self, 
-        sorted_regions: List[dict]
-    ) -> List[List[str]]:
-        """
-        Group text lines into paragraphs based on vertical spacing.
-        
-        Uses adaptive threshold based on average line height.
-        """
-        if not sorted_regions:
-            return []
-        
-        if len(sorted_regions) == 1:
-            return [[sorted_regions[0]['text']]]
-        
-        # Calculate average line height
-        heights = [r['bbox']['height'] for r in sorted_regions if r['bbox']['height'] > 0]
-        avg_height = sum(heights) / len(heights) if heights else 20
-        
-        # Paragraph break threshold: 1.5x average line height
-        para_threshold = avg_height * 1.5
-        
-        paragraphs = []
-        current_para = [sorted_regions[0]['text']]
-        prev_region = sorted_regions[0]
-        
-        for region in sorted_regions[1:]:
-            # Calculate vertical gap from previous region
-            vertical_gap = region['bbox']['y0'] - prev_region['bbox']['y1']
-            
-            if vertical_gap > para_threshold:
-                # Start new paragraph
-                if current_para:
-                    paragraphs.append(current_para)
-                current_para = [region['text']]
-            else:
-                # Continue current paragraph
-                current_para.append(region['text'])
-            
-            prev_region = region
-        
-        # Don't forget the last paragraph
-        if current_para:
-            paragraphs.append(current_para)
-        
-        return paragraphs
     
     def render_page(self, page_num: int, zoom: float = 1.0) -> Tuple[bytes, int, int]:
         """
@@ -775,6 +475,589 @@ class PDFProcessor:
         img_bytes = pix.tobytes("png")
         return img_bytes, pix.width, pix.height
     
+    # ------------------------------------------------------------------
+    # Markdown element parser for RapidDoc output
+    # ------------------------------------------------------------------
+    
+    @staticmethod
+    def _parse_rapiddoc_markdown(md_text: str) -> List[Dict[str, Any]]:
+        """
+        Parse RapidDoc's Markdown output into structured elements.
+        
+        Each element is a dict with:
+        - type: 'heading', 'paragraph', 'table', 'empty'
+        - level: heading level (1-6) for headings, 0 for others
+        - text: the text content (Markdown markers stripped)
+        - raw: original Markdown text
+        
+        Returns:
+            List of elements in document order
+        """
+        elements = []
+        lines = md_text.split('\n')
+        current_paragraph: List[str] = []
+        in_table = False
+        table_lines: List[str] = []
+        
+        def flush_paragraph():
+            nonlocal current_paragraph
+            if current_paragraph:
+                text = ' '.join(current_paragraph).strip()
+                if text:
+                    elements.append({
+                        'type': 'paragraph',
+                        'level': 0,
+                        'text': text,
+                        'raw': '\n'.join(current_paragraph),
+                    })
+                current_paragraph = []
+        
+        def flush_table():
+            nonlocal table_lines, in_table
+            if table_lines:
+                elements.append({
+                    'type': 'table',
+                    'level': 0,
+                    'text': '\n'.join(table_lines),
+                    'raw': '\n'.join(table_lines),
+                })
+                table_lines = []
+            in_table = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Empty line: flush paragraph
+            if not stripped:
+                if in_table:
+                    flush_table()
+                flush_paragraph()
+                continue
+            
+            # Table line (starts with |)
+            if stripped.startswith('|'):
+                if not in_table:
+                    flush_paragraph()
+                in_table = True
+                # Skip separator lines like |---|---|
+                if re.match(r'^\|[\s\-:|]+\|$', stripped):
+                    continue
+                table_lines.append(stripped)
+                continue
+            
+            if in_table:
+                flush_table()
+            
+            # Heading
+            heading_match = re.match(r'^(#{1,6})\s+(.+)', stripped)
+            if heading_match:
+                flush_paragraph()
+                level = len(heading_match.group(1))
+                text = heading_match.group(2).strip()
+                elements.append({
+                    'type': 'heading',
+                    'level': level,
+                    'text': text,
+                    'raw': stripped,
+                })
+                continue
+            
+            # Image reference (skip)
+            if stripped.startswith('!['):
+                continue
+            
+            # Regular text line → accumulate into paragraph
+            current_paragraph.append(stripped)
+        
+        # Flush remaining
+        if in_table:
+            flush_table()
+        flush_paragraph()
+        
+        return elements
+    
+    # ------------------------------------------------------------------
+    # RapidDoc-based scanned page translation (structured output)
+    # ------------------------------------------------------------------
+    
+    def _translate_scanned_page_rapiddoc(
+        self,
+        new_doc: pymupdf.Document,
+        page: pymupdf.Page,
+        page_num: int,
+        translator,
+        text_color: Tuple[float, float, float] = (0, 0, 0),
+        ocr_language: str = "en"
+    ) -> pymupdf.Document:
+        """
+        Translate a scanned page using RapidDoc (structured document parsing).
+        
+        Unlike plain RapidOCR, RapidDoc provides:
+        - Heading detection (# / ## / ###) via PP-DocLayoutV2 layout analysis
+        - Table recognition (UNET + SLANET_PLUS)
+        - Reading order restoration
+        - Proper paragraph segmentation
+        
+        Strategy:
+        1. RapidDoc extracts structured Markdown from the page
+        2. Parse Markdown into elements (headings, paragraphs, tables)
+        3. Translate each element preserving its semantic role
+        4. Create clean page with proper typographic hierarchy
+        
+        Args:
+            new_doc: Document to modify
+            page: Original page to translate
+            page_num: Page number (for logging)
+            translator: Translation engine
+            text_color: Color for translated text
+            ocr_language: Language code (for logging)
+            
+        Returns:
+            Document with translated structured content
+        """
+        global _rapiddoc_engine_instance
+        
+        if not RAPIDDOC_AVAILABLE or _rapiddoc_engine_instance is None:
+            logging.warning(f"Page {page_num + 1}: RapidDoc not available, falling back to RapidOCR")
+            return self._translate_scanned_page(
+                new_doc, page, page_num, translator, text_color, ocr_language
+            )
+        
+        try:
+            # ============================================
+            # STEP 1: Read original PDF bytes for RapidDoc
+            # ============================================
+            page_rect = page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            
+            # Read original PDF bytes
+            pdf_bytes = open(self.pdf_path, 'rb').read()
+            
+            logging.info(f"Page {page_num + 1}: Using RapidDoc for structured extraction")
+            
+            # ============================================
+            # STEP 2: Extract structured Markdown via RapidDoc
+            # ============================================
+            md_content, metadata = _rapiddoc_engine_instance.extract_page_markdown(
+                pdf_bytes,
+                page_num=page_num,
+                parse_method='auto',
+                table_enable=True,
+                formula_enable=False,
+            )
+            
+            if not md_content or len(md_content.strip()) < 5:
+                logging.warning(f"Page {page_num + 1}: RapidDoc returned no content, falling back to RapidOCR")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, text_color, ocr_language
+                )
+            
+            logging.info(
+                f"Page {page_num + 1}: RapidDoc extracted {len(md_content)} chars, "
+                f"{metadata['num_elements']} elements in {metadata['elapsed']:.1f}s"
+            )
+            
+            # Detect multi-column layout from block bounding boxes
+            detected_columns = 1
+            col_x_ranges: list = []
+            if metadata.get('block_bboxes'):
+                detected_columns, col_x_ranges = _rapiddoc_engine_instance.detect_column_count(
+                    metadata['block_bboxes'],
+                    metadata.get('page_size'),
+                )
+                if detected_columns > 1:
+                    logging.info(
+                        f"Page {page_num + 1}: Detected {detected_columns}-column layout "
+                        f"(x-ranges: {[(f'{x0:.0f}-{x1:.0f}') for x0, x1 in col_x_ranges]})"
+                    )
+            
+            # ============================================
+            # STEP 3: Parse Markdown into structured elements
+            # ============================================
+            elements = self._parse_rapiddoc_markdown(md_content)
+            
+            if not elements:
+                logging.warning(f"Page {page_num + 1}: No elements parsed from RapidDoc output")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, text_color, ocr_language
+                )
+            
+            logging.info(
+                f"Page {page_num + 1}: Parsed {len(elements)} elements "
+                f"({sum(1 for e in elements if e['type'] == 'heading')} headings, "
+                f"{sum(1 for e in elements if e['type'] == 'paragraph')} paragraphs, "
+                f"{sum(1 for e in elements if e['type'] == 'table')} tables)"
+            )
+            
+            # ============================================
+            # STEP 4: Translate each element
+            # ============================================
+            translated_elements = []
+            for elem in elements:
+                if elem['type'] == 'table':
+                    # For tables: translate cell-by-cell
+                    translated_table = self._translate_table_element(elem, translator)
+                    translated_elements.append(translated_table)
+                elif elem['text'] and len(elem['text'].strip()) >= 2:
+                    try:
+                        translated = translator.translate(elem['text'])
+                        if translated and translated.strip():
+                            translated_elements.append({
+                                **elem,
+                                'text': translated.strip(),
+                            })
+                        else:
+                            translated_elements.append(elem)
+                    except Exception as e:
+                        logging.warning(f"Translation failed for element: {e}")
+                        translated_elements.append(elem)
+                else:
+                    translated_elements.append(elem)
+            
+            logging.info(f"Page {page_num + 1}: Translated {len(translated_elements)} elements")
+            
+            # ============================================
+            # STEP 5: Build single HTML document and render
+            # ============================================
+            # Instead of inserting elements one-by-one (which wastes space
+            # on height estimation and causes overflow), build ALL content
+            # as a single HTML document. PyMuPDF's insert_htmlbox() with
+            # scale_low=0 will auto-scale the content to fit the page.
+            
+            new_page = new_doc[0]
+            
+            # Clear everything — draw white rectangle over entire page
+            new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
+            
+            # Adaptive margins — tighter for dense content
+            total_chars = sum(len(e.get('text', '')) for e in translated_elements)
+            is_dense = total_chars > 2000 or len(translated_elements) > 20
+            
+            if is_dense:
+                margin_lr = max(28, page_width * 0.04)
+                margin_top = max(30, page_height * 0.035)
+                margin_bottom = max(30, page_height * 0.035)
+            else:
+                margin_lr = max(36, page_width * 0.06)
+                margin_top = max(40, page_height * 0.045)
+                margin_bottom = max(40, page_height * 0.045)
+            
+            text_rect = pymupdf.Rect(
+                margin_lr, margin_top,
+                page_width - margin_lr, page_height - margin_bottom
+            )
+            text_width = text_rect.width
+            
+            if text_width < 100:
+                text_rect = pymupdf.Rect(
+                    20, margin_top,
+                    page_width - 20, page_height - margin_bottom
+                )
+                text_width = text_rect.width
+            
+            # Base font sizing — adaptive based on page size
+            body_font_size = max(8, min(11, text_width / 50))
+            
+            # CSS color
+            css_color = f"rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)})"
+            
+            # Build HTML document from all translated elements
+            html_parts = []
+            for elem in translated_elements:
+                elem_type = elem['type']
+                elem_text = elem.get('text', '').strip()
+                
+                if not elem_text:
+                    continue
+                
+                if elem_type == 'heading':
+                    level = min(elem.get('level', 1), 6)
+                    html_parts.append(
+                        f'<h{level}>{_escape_html(elem_text)}</h{level}>'
+                    )
+                elif elem_type == 'table':
+                    table_html = self._render_table_as_html(
+                        elem_text, body_font_size, text_color
+                    )
+                    html_parts.append(table_html)
+                else:  # paragraph
+                    html_parts.append(
+                        f'<p>{_escape_html(elem_text)}</p>'
+                    )
+            
+            full_html = '\n'.join(html_parts)
+            
+            # Build CSS stylesheet
+            # Heading scale factors: h1=1.5x, h2=1.3x, h3=1.15x, h4=1.05x
+            h1_size = body_font_size * 1.5
+            h2_size = body_font_size * 1.3
+            h3_size = body_font_size * 1.15
+            h4_size = body_font_size * 1.05
+            
+            # Tighter spacing for dense pages
+            if is_dense:
+                p_margin = f"{body_font_size * 0.25:.1f}pt"
+                h_margin_top = f"{body_font_size * 0.5:.1f}pt"
+                h_margin_bottom = f"{body_font_size * 0.2:.1f}pt"
+                line_height = "1.15"
+            else:
+                p_margin = f"{body_font_size * 0.4:.1f}pt"
+                h_margin_top = f"{body_font_size * 0.8:.1f}pt"
+                h_margin_bottom = f"{body_font_size * 0.3:.1f}pt"
+                line_height = "1.25"
+            
+            css = f"""
+            * {{
+                font-family: Helvetica, Arial, sans-serif;
+                color: {css_color};
+                margin: 0;
+                padding: 0;
+            }}
+            p {{
+                font-size: {body_font_size:.1f}pt;
+                line-height: {line_height};
+                margin-top: {p_margin};
+                margin-bottom: {p_margin};
+                text-align: justify;
+            }}
+            h1 {{
+                font-size: {h1_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.15;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h2 {{
+                font-size: {h2_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.15;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h3 {{
+                font-size: {h3_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.2;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            h4, h5, h6 {{
+                font-size: {h4_size:.1f}pt;
+                font-weight: bold;
+                line-height: 1.2;
+                margin-top: {h_margin_top};
+                margin-bottom: {h_margin_bottom};
+            }}
+            table {{
+                border-collapse: collapse;
+                width: 100%;
+                margin-top: {p_margin};
+                margin-bottom: {p_margin};
+            }}
+            td, th {{
+                border: 1px solid #ccc;
+                padding: 3px 5px;
+                text-align: left;
+                font-size: {body_font_size * 0.88:.1f}pt;
+                line-height: 1.15;
+            }}
+            th {{
+                font-weight: bold;
+                background-color: #f5f5f5;
+            }}
+            """
+            
+            total_inserted = len(translated_elements)
+            
+            if detected_columns > 1:
+                # ── MULTI-COLUMN: use Story API with multiple rects ──
+                # PyMuPDF's insert_htmlbox ignores CSS column-count.
+                # The correct approach is to create a Story and flow
+                # content across separate column rectangles.
+                
+                if col_x_ranges:
+                    # Use actual column positions from layout detection
+                    col_rects = []
+                    for cx0, cx1 in col_x_ranges:
+                        col_rects.append(pymupdf.Rect(
+                            cx0, text_rect.y0,
+                            cx1, text_rect.y1
+                        ))
+                else:
+                    # Fallback: evenly divide text_rect
+                    col_gap = body_font_size * 1.5
+                    col_w = (text_rect.width - col_gap * (detected_columns - 1)) / detected_columns
+                    col_rects = []
+                    for ci in range(detected_columns):
+                        x0 = text_rect.x0 + ci * (col_w + col_gap)
+                        col_rects.append(pymupdf.Rect(
+                            x0, text_rect.y0,
+                            x0 + col_w, text_rect.y1
+                        ))
+                
+                mediabox = pymupdf.Rect(0, 0, page_width, page_height)
+                
+                story = pymupdf.Story(html=full_html, user_css=css)
+                
+                def rectfn(rect_num, filled):
+                    if rect_num < detected_columns:
+                        # First rect starts a new page; rest stay on same page
+                        mb = mediabox if rect_num == 0 else None
+                        return (mb, col_rects[rect_num], None)
+                    return (None, None, None)  # stop — single page only
+                
+                temp_doc = story.write_with_links(rectfn)
+                
+                # Overlay the temp page onto our output page
+                new_page.show_pdf_page(page_rect, temp_doc, 0)
+                
+                # Log column layout info
+                temp_page = temp_doc[0]
+                temp_words = temp_page.get_text('words')
+                mid_x = page_width / 2
+                left_w = sum(1 for w in temp_words if w[2] < mid_x)
+                right_w = sum(1 for w in temp_words if w[0] > mid_x)
+                
+                logging.info(
+                    f"Page {page_num + 1}: RapidDoc {detected_columns}-column layout "
+                    f"({left_w} words left, {right_w} words right, "
+                    f"{total_inserted} elements)"
+                )
+                
+                try:
+                    temp_doc.close()
+                except Exception:
+                    pass
+            else:
+                # ── SINGLE-COLUMN: use insert_htmlbox with auto-scaling ──
+                # scale_low=0 means PyMuPDF will shrink content as much as
+                # needed to fit; minimum readable is ~0.3 of original
+                result = new_page.insert_htmlbox(
+                    text_rect, full_html, css=css, scale_low=0
+                )
+                spare_height, scale = result
+                
+                if spare_height < 0:
+                    logging.warning(
+                        f"Page {page_num + 1}: Content could not fit even with "
+                        f"full scaling (scale={scale:.2f})"
+                    )
+                elif scale < 1.0:
+                    logging.info(
+                        f"Page {page_num + 1}: Content auto-scaled to "
+                        f"{scale:.0%} to fit page "
+                        f"(spare={spare_height:.0f}pt)"
+                    )
+                
+                logging.info(
+                    f"Page {page_num + 1}: RapidDoc clean page created with "
+                    f"{total_inserted} translated elements "
+                    f"(scale={scale:.0%}, spare_height={spare_height:.0f}pt)"
+                )
+            return new_doc
+            
+        except Exception as e:
+            capture_exception(e, context={
+                "operation": "translate_scanned_page_rapiddoc",
+                "page_num": page_num,
+            }, tags={"component": "pdf_processor"})
+            logging.error(
+                f"Page {page_num + 1}: RapidDoc translation failed: {e}, "
+                f"falling back to RapidOCR", exc_info=True
+            )
+            # Fallback to plain RapidOCR
+            return self._translate_scanned_page(
+                new_doc, page, page_num, translator, text_color, ocr_language
+            )
+    
+    def _translate_table_element(
+        self, elem: Dict[str, Any], translator
+    ) -> Dict[str, Any]:
+        """
+        Translate a table element cell-by-cell.
+        
+        Parses Markdown table lines (|col1|col2|...) and translates
+        each cell individually to preserve table structure.
+        """
+        lines = elem['text'].strip().split('\n')
+        translated_lines = []
+        
+        for line in lines:
+            if not line.strip().startswith('|'):
+                translated_lines.append(line)
+                continue
+            
+            cells = [c.strip() for c in line.split('|')]
+            # Remove empty first/last from leading/trailing |
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+            
+            translated_cells = []
+            for cell in cells:
+                if cell and len(cell.strip()) >= 2:
+                    try:
+                        translated = translator.translate(cell.strip())
+                        translated_cells.append(translated or cell)
+                    except Exception:
+                        translated_cells.append(cell)
+                else:
+                    translated_cells.append(cell)
+            
+            translated_lines.append('| ' + ' | '.join(translated_cells) + ' |')
+        
+        return {
+            **elem,
+            'text': '\n'.join(translated_lines),
+        }
+    
+    @staticmethod
+    def _render_table_as_html(
+        table_text: str,
+        font_size: float,
+        text_color: Tuple[float, float, float]
+    ) -> str:
+        """
+        Convert a Markdown-style table to HTML for PDF rendering.
+        
+        Args:
+            table_text: Pipe-separated table text (|col1|col2|...)
+            font_size: Base font size
+            text_color: Text color tuple
+            
+        Returns:
+            HTML string with <table> structure
+        """
+        lines = table_text.strip().split('\n')
+        if not lines:
+            return f"<p>{table_text}</p>"
+        
+        html_parts = ['<table>']
+        
+        for i, line in enumerate(lines):
+            if not line.strip().startswith('|'):
+                continue
+            
+            cells = [c.strip() for c in line.split('|')]
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+            
+            if not cells:
+                continue
+            
+            tag = 'th' if i == 0 else 'td'
+            html_parts.append('<tr>')
+            for cell in cells:
+                html_parts.append(f'<{tag}>{_escape_html(cell)}</{tag}>')
+            html_parts.append('</tr>')
+        
+        html_parts.append('</table>')
+        return '\n'.join(html_parts)
+    
     def _translate_scanned_page(
         self,
         new_doc: pymupdf.Document,
@@ -785,20 +1068,15 @@ class PDFProcessor:
         ocr_language: str = "en"
     ) -> pymupdf.Document:
         """
-        Translate a scanned (image-based) page using CLEAN SLATE approach.
+        Translate a scanned (image-based) page using RapidOCR + CLEAN SLATE approach.
         
-        Strategy (CLEAN SLATE - no overlapping issues):
-        1. Create a NEW BLANK PAGE with same dimensions
-        2. Use LayoutDetection to identify columns and text regions  
-        3. Run PaddleOCR to extract all text with positions
-        4. Group text by COLUMN to respect layout
-        5. Translate each column separately
-        6. Insert translated text into column boundaries on blank page
-        
-        This approach avoids:
-        - Text overlapping (each column has its own space)
-        - Original text showing through (blank page)
-        - Redaction failures
+        Strategy:
+        1. Render page to high-resolution image
+        2. RapidOCR extracts all text (detection + classification + recognition)
+        3. Post-process OCR text (fix errors, normalize)
+        4. Split into paragraphs and translate each
+        5. Create CLEAN BLANK PAGE with same dimensions
+        6. Insert translated text as flowing paragraphs
         
         Args:
             new_doc: Document to modify (will be replaced with clean page)
@@ -806,7 +1084,7 @@ class PDFProcessor:
             page_num: Page number (for logging)
             translator: Translation engine
             text_color: Color for translated text
-            ocr_language: Language code for OCR
+            ocr_language: Language code (for logging)
             
         Returns:
             New document with translated content on clean page
@@ -817,492 +1095,164 @@ class PDFProcessor:
         
         try:
             # ============================================
-            # STEP 0: Get page dimensions
+            # STEP 1: Get page dimensions and render to image
             # ============================================
             page_rect = page.rect
             page_width = page_rect.width
             page_height = page_rect.height
             
-            # Convert page to image for OCR
-            ocr_scale = 2.0
+            # Convert page to high-resolution PNG for OCR
+            ocr_scale = 2.0  # 2x = 144 DPI — good balance of quality vs speed
             pix = page.get_pixmap(matrix=pymupdf.Matrix(ocr_scale, ocr_scale))
             img_data = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_data))
-            img_array = np.array(img)
-            img_array_original = img_array.copy()  # Keep original for layout detection
+            
+            logging.info(f"Page {page_num + 1}: Rendered to {pix.width}x{pix.height} for RapidOCR")
             
             # ============================================
-            # STEP 1: Layout Detection - AUTOMATIC column detection
-            # Run on ORIGINAL image to get accurate column coordinates
+            # STEP 2: RapidOCR text extraction
             # ============================================
-            layout_engine = self._get_layout_engine()
-            num_columns = 1
-            column_boundaries = [(0, page_width)]  # List of (x0, x1) tuples
+            ocr_text = _ocr_engine_instance.recognize_document_page(
+                img_data, 
+                detect_tables=True
+            )
             
-            if layout_engine and LAYOUT_DETECTION_AVAILABLE:
-                logging.info(f"Page {page_num + 1}: Running LayoutDetection...")
-                try:
-                    layout_result = layout_engine.predict(img_array_original)
-                    if layout_result and len(layout_result) > 0:
-                        boxes = layout_result[0].get('boxes', [])
-                        text_boxes = [b for b in boxes if b.get('label') in ['text', 'title', 'content'] and b.get('score', 0) > 0.5]
-                        
-                        if text_boxes:
-                            # Auto-detect columns by clustering X centers
-                            x_centers = []
-                            for box in text_boxes:
-                                coord = box['coordinate']
-                                x0 = coord[0] / ocr_scale
-                                x1 = coord[2] / ocr_scale
-                                x_centers.append({
-                                    'center': (x0 + x1) / 2,
-                                    'x0': x0,
-                                    'x1': x1
-                                })
-                            
-                            # Sort by center X
-                            x_centers.sort(key=lambda c: c['center'])
-                            
-                            # Find gaps to identify column boundaries
-                            # Gap = significant horizontal space between regions
-                            # Use adaptive gap: smaller of 3% page width or 30pts
-                            MIN_GAP = min(page_width * 0.03, 30)
-                            column_clusters = []
-                            current_cluster = [x_centers[0]]
-                            
-                            for i in range(1, len(x_centers)):
-                                prev_right = max(c['x1'] for c in current_cluster)
-                                curr_left = x_centers[i]['x0']
-                                gap = curr_left - prev_right
-                                
-                                if gap > MIN_GAP:
-                                    # New column detected
-                                    column_clusters.append(current_cluster)
-                                    current_cluster = [x_centers[i]]
-                                else:
-                                    current_cluster.append(x_centers[i])
-                            
-                            column_clusters.append(current_cluster)
-                            num_columns = len(column_clusters)
-                            
-                            # Calculate boundaries for each column
-                            column_boundaries = []
-                            for cluster in column_clusters:
-                                col_x0 = min(c['x0'] for c in cluster) - 5
-                                col_x1 = max(c['x1'] for c in cluster) + 5
-                                column_boundaries.append((max(0, col_x0), min(page_width, col_x1)))
-                            
-                            logging.info(f"Page {page_num + 1}: Auto-detected {num_columns} columns: {[(int(b[0]), int(b[1])) for b in column_boundaries]}")
-                except Exception as e:
-                    logging.warning(f"Page {page_num + 1}: LayoutDetection failed: {e}")
-            
-            # ============================================
-            # STEP 2: Preprocess image (rotation, dewarping) - for OCR only
-            # Note: We use original coordinates for layout, but preprocessed image for better OCR
-            # ============================================
-            doc_preprocessor = self._get_doc_preprocessor()
-            if doc_preprocessor and DOC_PREPROCESSOR_AVAILABLE:
-                logging.info(f"Page {page_num + 1}: Running DocPreprocessor...")
-                try:
-                    preprocess_result = doc_preprocessor.predict(img_array)
-                    if preprocess_result and len(preprocess_result) > 0:
-                        result_data = preprocess_result[0]
-                        angle = result_data.get('angle', 0)
-                        if angle != 0:
-                            logging.info(f"Page {page_num + 1}: Detected rotation of {angle}°, correcting...")
-                        if 'output_img' in result_data and result_data['output_img'] is not None:
-                            # Only use preprocessed image if dimensions match (no rotation)
-                            preprocessed = result_data['output_img']
-                            if preprocessed.shape == img_array.shape:
-                                img_array = preprocessed
-                                logging.info(f"Page {page_num + 1}: Image preprocessing applied")
-                            else:
-                                logging.warning(f"Page {page_num + 1}: Skipping preprocessing (shape mismatch)")
-                except Exception as e:
-                    logging.warning(f"Page {page_num + 1}: DocPreprocessor failed: {e}")
-            
-            # ============================================
-            # STEP 3: Run OCR
-            # ============================================
-            ocr = self._get_ocr_engine(ocr_language)
-            if ocr is None:
-                logging.error(f"Page {page_num + 1}: Failed to get OCR engine")
+            if not ocr_text or len(ocr_text.strip()) < 5:
+                logging.warning(f"Page {page_num + 1}: RapidOCR returned no usable text")
                 return new_doc
             
-            logging.info(f"Page {page_num + 1}: Running PaddleOCR...")
-            result = None
-            for attempt in range(2):
-                try:
-                    result = ocr.predict(img_array)
-                    break
-                except RuntimeError as e:
-                    logging.warning(f"Page {page_num + 1}: OCR attempt {attempt + 1} failed: {e}")
-                    if attempt == 0:
-                        pix_low = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
-                        img_low = Image.open(io.BytesIO(pix_low.tobytes("png")))
-                        img_array = np.array(img_low)
-                        ocr_scale = 1.5
-            
-            if not result or len(result) == 0:
-                logging.warning(f"Page {page_num + 1}: OCR returned no results")
-                return new_doc
-            
-            ocr_result = result[0]
-            texts = ocr_result.get('rec_texts', [])
-            scores = ocr_result.get('rec_scores', [])
-            polys = ocr_result.get('rec_polys', [])
-            
-            if not texts:
-                logging.warning(f"Page {page_num + 1}: No text found by OCR")
-                return new_doc
-            
-            logging.info(f"Page {page_num + 1}: OCR found {len(texts)} text regions")
+            logging.info(f"Page {page_num + 1}: RapidOCR extracted {len(ocr_text)} chars")
             
             # ============================================
-            # STEP 4: Build text regions and assign columns dynamically
+            # STEP 3: Post-process OCR text
             # ============================================
-            MIN_CONFIDENCE = 0.5
-            text_regions = []
-            
-            for text, score, poly in zip(texts, scores, polys):
-                if score < MIN_CONFIDENCE or not text.strip():
-                    continue
-                try:
-                    if hasattr(poly, 'tolist'):
-                        poly = poly.tolist()
-                    xs = [p[0] / ocr_scale for p in poly]
-                    ys = [p[1] / ocr_scale for p in poly]
-                    
-                    bbox = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys))
-                    center_x = (min(xs) + max(xs)) / 2
-                    center_y = (min(ys) + max(ys)) / 2
-                    
-                    # Find which column this region belongs to
-                    column = 0
-                    for col_idx, (col_x0, col_x1) in enumerate(column_boundaries):
-                        if col_x0 <= center_x <= col_x1:
-                            column = col_idx
-                            break
-                    else:
-                        # If not in any boundary, find closest column
-                        min_dist = float('inf')
-                        for col_idx, (col_x0, col_x1) in enumerate(column_boundaries):
-                            col_center = (col_x0 + col_x1) / 2
-                            dist = abs(center_x - col_center)
-                            if dist < min_dist:
-                                min_dist = dist
-                                column = col_idx
-                    
-                    text_regions.append({
-                        'text': text.strip(),
-                        'bbox': bbox,
-                        'center_x': center_x,
-                        'center_y': center_y,
-                        'height': max(ys) - min(ys),
-                        'x0': min(xs),
-                        'column': column
-                    })
-                except Exception:
-                    continue
-            
-            if not text_regions:
-                logging.warning(f"Page {page_num + 1}: No valid text regions")
-                return new_doc
+            # post_process_ocr_text include già clean_ocr_text come primo passo
+            ocr_text = post_process_ocr_text(ocr_text)
             
             # ============================================
-            # STEP 5: Group into lines BY COLUMN
+            # STEP 4: Split into paragraphs and translate
             # ============================================
-            columns_data = {}
-            for region in text_regions:
-                col = region['column']
-                if col not in columns_data:
-                    columns_data[col] = []
-                columns_data[col].append(region)
+            # OCR output uses double newlines for paragraphs
+            raw_paragraphs = re.split(r'\n\s*\n', ocr_text)
             
-            all_lines = []
-            for col_idx in sorted(columns_data.keys()):
-                col_regions = columns_data[col_idx]
-                col_regions.sort(key=lambda r: (r['center_y'], r['x0']))
-                
-                lines = []
-                if col_regions:
-                    current_line = [col_regions[0]]
-                    LINE_THRESHOLD = col_regions[0]['height'] * 0.6
-                    
-                    for region in col_regions[1:]:
-                        if abs(region['center_y'] - current_line[0]['center_y']) < LINE_THRESHOLD:
-                            current_line.append(region)
-                        else:
-                            lines.append((col_idx, current_line))
-                            current_line = [region]
-                            LINE_THRESHOLD = region['height'] * 0.6
-                    lines.append((col_idx, current_line))
-                all_lines.extend(lines)
-            
-            logging.info(f"Page {page_num + 1}: {len(all_lines)} lines in {len(columns_data)} column(s)")
-            
-            # ============================================
-            # STEP 5.5: Group lines into PARAGRAPHS and fix hyphenation
-            # ============================================
-            import re
-            
-            def is_section_number(text):
-                """Check if text is just a section number like '4.6', '5.7', '2.1'"""
-                text = text.strip()
-                return bool(re.match(r'^\d+\.?\d*\.?\s*$', text))
-            
-            def is_title_or_heading(text):
-                """Detect if text is a title/heading (Article X, numbered sections, etc.)"""
-                text = text.strip()
-                # Article headers: "Article 1", "Article 2 - Title"
-                if re.match(r'^Article\s+\d+', text, re.IGNORECASE):
-                    return True
-                # Section numbers alone: "2.1", "4.6", "5.7" - these are headings
-                if re.match(r'^\d+\.\d+\.?\s*$', text):
-                    return True
-                # All caps titles
-                if text.isupper() and len(text) > 3:
-                    return True
-                return False
-            
-            def ends_sentence(text):
-                """Check if text ends with sentence-ending punctuation"""
-                text = text.strip()
-                return text.endswith('.') or text.endswith('!') or text.endswith('?') or text.endswith(':')
-            
-            def fix_hyphenation(line1, line2):
-                """Join hyphenated words across lines: 're-' + 'sponsible' -> 'responsible'"""
-                if line1.rstrip().endswith('-'):
-                    # Remove the hyphen and join with next word
-                    line1_fixed = line1.rstrip()[:-1]
-                    # Find first word of line2
-                    words = line2.split(None, 1)
-                    if words:
-                        first_word = words[0]
-                        rest = words[1] if len(words) > 1 else ''
-                        return line1_fixed + first_word, rest
-                return line1, line2
-            
-            def clean_inline_section_numbers(text):
-                """Remove section numbers that appear inline within text (margin annotations)"""
-                # Remove patterns like " 4.6 " or " 5.7 " that appear mid-text
-                # Pattern 1: number.number surrounded by text (not at line start)
-                cleaned = re.sub(r'(?<=\S)\s+\d+\.\d+\s+(?=\S)', ' ', text)
-                # Pattern 2: standalone single digit like " 5 " mid-sentence (page numbers, etc)
-                cleaned = re.sub(r'(?<=[a-zA-Z])\s+\d\s+(?=[A-Z])', ' ', cleaned)
-                # Pattern 3: number.number after punctuation and space
-                cleaned = re.sub(r'([.!?])\s+\d+\.\d+\s+', r'\1 ', cleaned)
-                # Also clean up multiple spaces
-                cleaned = re.sub(r'\s+', ' ', cleaned)
-                return cleaned.strip()
-            
-            # Build paragraphs from lines, respecting column boundaries
-            paragraphs_by_column = {i: [] for i in range(num_columns)}
-            
-            for col_idx in sorted(columns_data.keys()):
-                col_lines = [(idx, regions) for idx, regions in all_lines if idx == col_idx]
-                
-                if not col_lines:
+            translated_paragraphs = []
+            for para in raw_paragraphs:
+                para = para.strip()
+                if not para or len(para) < 3:
                     continue
                 
-                current_paragraph_texts = []
-                current_paragraph_regions = []
-                
-                for _, line_regions in col_lines:
-                    line_regions_sorted = sorted(line_regions, key=lambda r: r['x0'])
-                    line_text = ' '.join(r['text'] for r in line_regions_sorted)
-                    
-                    # Skip lines that are just section numbers (margin annotations)
-                    if is_section_number(line_text):
-                        continue
-                    
-                    # Check if this is a title/heading - start new paragraph
-                    if is_title_or_heading(line_text):
-                        # Save current paragraph if exists
-                        if current_paragraph_texts:
-                            paragraphs_by_column[col_idx].append({
-                                'texts': current_paragraph_texts,
-                                'regions': current_paragraph_regions
-                            })
-                        # Title is its own paragraph
-                        paragraphs_by_column[col_idx].append({
-                            'texts': [line_text],
-                            'regions': line_regions_sorted
-                        })
-                        current_paragraph_texts = []
-                        current_paragraph_regions = []
-                        continue
-                    
-                    # Handle hyphenation with previous line
-                    if current_paragraph_texts:
-                        prev_text = current_paragraph_texts[-1]
-                        fixed_prev, fixed_current = fix_hyphenation(prev_text, line_text)
-                        current_paragraph_texts[-1] = fixed_prev
-                        line_text = fixed_current if fixed_current else line_text
-                    
-                    current_paragraph_texts.append(line_text)
-                    current_paragraph_regions.extend(line_regions_sorted)
-                    
-                    # Check if paragraph ends (sentence ends)
-                    if ends_sentence(line_text):
-                        paragraphs_by_column[col_idx].append({
-                            'texts': current_paragraph_texts,
-                            'regions': current_paragraph_regions
-                        })
-                        current_paragraph_texts = []
-                        current_paragraph_regions = []
-                
-                # Don't forget remaining text
-                if current_paragraph_texts:
-                    paragraphs_by_column[col_idx].append({
-                        'texts': current_paragraph_texts,
-                        'regions': current_paragraph_regions
-                    })
+                # Translate the paragraph
+                translated = translator.translate(para)
+                if translated and translated.strip():
+                    translated_paragraphs.append(translated.strip())
+                else:
+                    # Keep original if translation fails
+                    translated_paragraphs.append(para)
             
-            total_paragraphs = sum(len(p) for p in paragraphs_by_column.values())
-            logging.info(f"Page {page_num + 1}: {total_paragraphs} paragraphs grouped from {len(all_lines)} lines")
+            if not translated_paragraphs:
+                logging.warning(f"Page {page_num + 1}: No paragraphs to insert after translation")
+                return new_doc
+            
+            logging.info(f"Page {page_num + 1}: Translated {len(translated_paragraphs)} paragraphs")
             
             # ============================================
-            # STEP 6: Translate PARAGRAPHS and prepare column content
+            # STEP 5: CREATE CLEAN PAGE and insert translated text
             # ============================================
-            column_content = {i: [] for i in range(num_columns)}
-            
-            for col_idx in sorted(paragraphs_by_column.keys()):
-                paragraphs = paragraphs_by_column[col_idx]
-                
-                for para in paragraphs:
-                    # Join all lines in paragraph with space
-                    para_text = ' '.join(para['texts'])
-                    # Clean up inline section numbers and extra spaces
-                    para_text = clean_inline_section_numbers(para_text)
-                    # Apply OCR post-processing to fix common errors
-                    para_text = clean_ocr_text(para_text)
-                    
-                    if not para_text:
-                        continue
-                    
-                    # Calculate bounding box for entire paragraph
-                    regions = para['regions']
-                    if not regions:
-                        continue
-                    
-                    para_bbox = pymupdf.Rect(
-                        min(r['bbox'].x0 for r in regions),
-                        min(r['bbox'].y0 for r in regions),
-                        max(r['bbox'].x1 for r in regions),
-                        max(r['bbox'].y1 for r in regions)
-                    )
-                    avg_height = sum(r['height'] for r in regions) / len(regions)
-                    
-                    # Translate the whole paragraph
-                    translated = translator.translate(para_text)
-                    if translated and translated.strip():
-                        column_content[col_idx].append({
-                            'y': para_bbox.y0,
-                            'text': translated.strip(),
-                            'height': avg_height,
-                            'original_bbox': para_bbox,
-                            'para_height': para_bbox.height  # Full paragraph height for text box
-                        })
-            
-            # ============================================
-            # STEP 7: CREATE CLEAN PAGE and insert text
-            # ============================================
-            # Delete existing page content and create blank
             new_page = new_doc[0]
             
-            # Clear everything - draw white rectangle over entire page
+            # Clear everything — draw white rectangle over entire page
             new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
             
-            # Use detected column boundaries with small margin adjustments
-            margin_top = 30
-            line_spacing = 1.3
+            # Page margins
+            margin_left = max(30, page_width * 0.05)
+            margin_right = max(30, page_width * 0.05)
+            margin_top = max(40, page_height * 0.04)
+            margin_bottom = max(40, page_height * 0.04)
             
-            # Insert translated text column by column
+            # Text area
+            text_x0 = margin_left
+            text_x1 = page_width - margin_right
+            text_width = text_x1 - text_x0
+            
+            if text_width < 100:
+                # Fallback for very narrow pages
+                text_x0 = 20
+                text_x1 = page_width - 20
+            
+            # Font sizing — adaptive based on page size
+            # Standard A4 is 595 wide, typical body text is 10-11pt
+            base_font_size = max(8, min(11, text_width / 50))
+            
+            current_y = margin_top
             total_inserted = 0
+            paragraph_gap = base_font_size * 0.8  # Gap between paragraphs
             
-            # Track current Y position per column to avoid overlaps
-            column_y_tracker = {}
-            
-            for col_idx in sorted(column_content.keys()):
-                content = column_content[col_idx]
-                if not content:
-                    continue
+            for para_text in translated_paragraphs:
+                if current_y >= page_height - margin_bottom:
+                    logging.warning(f"Page {page_num + 1}: Ran out of space, {len(translated_paragraphs) - total_inserted} paragraphs remaining")
+                    break
                 
-                # Get column boundaries from auto-detected list
-                if col_idx < len(column_boundaries):
-                    col_x0, col_x1 = column_boundaries[col_idx]
-                else:
-                    # Fallback if column index out of range
-                    continue
+                # Estimate required height for the text box
+                # Rough estimate: chars per line, then lines needed
+                chars_per_line = max(1, int(text_width / (base_font_size * 0.5)))
+                estimated_lines = max(1, len(para_text) / chars_per_line + 1)
+                estimated_height = estimated_lines * base_font_size * 1.3
                 
-                col_width = col_x1 - col_x0
-                if col_width < 50:
-                    continue
+                # Ensure we don't exceed page
+                available_height = page_height - margin_bottom - current_y
+                box_height = min(estimated_height * 1.5, available_height)
                 
-                # Initialize Y tracker for this column
-                current_y = None
+                if box_height < base_font_size * 1.5:
+                    break  # Not enough space for even one line
                 
-                # Insert each paragraph in column
-                for item in content:
-                    original_y = item['y']
-                    text = item['text']
-                    height = item['height']
-                    # Use full paragraph height if available
-                    para_height = item.get('para_height', height * line_spacing)
+                text_rect = pymupdf.Rect(text_x0, current_y, text_x1, current_y + box_height)
+                
+                try:
+                    excess = new_page.insert_textbox(
+                        text_rect,
+                        para_text,
+                        fontsize=base_font_size,
+                        fontname="helv",
+                        color=text_color,
+                        align=0,  # Left-aligned
+                    )
                     
-                    # Prevent overlaps: use max of original position and current tracker
-                    if current_y is None:
-                        y_pos = original_y
-                    else:
-                        # Add small gap between blocks (3pt)
-                        y_pos = max(original_y, current_y + 3)
-                    
-                    # Font size: minimum 8pt for readability, max 12pt
-                    font_size = max(8, min(height * 0.85, 12))
-                    
-                    try:
-                        # Calculate text box height
-                        box_height = max(para_height, height * 2)
-                        text_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + box_height)
-                        
+                    if excess < 0:
+                        # Text didn't fit — try smaller font
+                        smaller_font = max(7, base_font_size * 0.8)
+                        expanded_rect = pymupdf.Rect(
+                            text_x0, current_y, text_x1, 
+                            current_y + box_height * 1.5
+                        )
                         excess = new_page.insert_textbox(
-                            text_rect,
-                            text,
-                            fontsize=font_size,
+                            expanded_rect,
+                            para_text,
+                            fontsize=smaller_font,
                             fontname="helv",
                             color=text_color,
-                            align=0
+                            align=0,
                         )
-                        
-                        if excess < 0:
-                            # Text didn't fit, try smaller font and expand box
-                            box_height = para_height * 1.5
-                            expanded_rect = pymupdf.Rect(col_x0, y_pos, col_x1, y_pos + box_height)
-                            new_page.insert_textbox(
-                                expanded_rect,
-                                text,
-                                fontsize=max(7, font_size * 0.8),  # Min 7pt fallback
-                                fontname="helv",
-                                color=text_color,
-                                align=0
-                            )
-                        
-                        # Update Y tracker to end of this block
-                        current_y = y_pos + box_height
-                        total_inserted += 1
-                    except Exception as e:
-                        logging.debug(f"Failed to insert paragraph: {e}")
+                        # Use expanded height for Y advancement
+                        actual_height = box_height * 1.5 if excess >= 0 else box_height
+                    else:
+                        # Calculate actual used height from excess
+                        actual_height = box_height - excess if excess > 0 else box_height
+                    
+                    current_y += actual_height + paragraph_gap
+                    total_inserted += 1
+                    
+                except Exception as e:
+                    logging.debug(f"Failed to insert paragraph: {e}")
+                    current_y += base_font_size * 2  # Skip some space and continue
             
-            logging.info(f"Page {page_num + 1}: Clean page created with {total_inserted} translated lines")
+            logging.info(f"Page {page_num + 1}: Clean page created with {total_inserted} translated paragraphs")
             return new_doc
             
         except Exception as e:
             capture_exception(e, context={
-                "operation": "translate_ocr_page",
+                "operation": "translate_scanned_page",
                 "page_num": page_num,
             }, tags={"component": "pdf_processor"})
-            logging.error(f"Page {page_num + 1}: OCR translation failed: {e}", exc_info=True)
+            logging.error(f"Page {page_num + 1}: Scanned page translation failed: {e}", exc_info=True)
             return new_doc
 
     def translate_page(
@@ -1327,8 +1277,8 @@ class PDFProcessor:
         6. Phase 5: Insert translations with inline formatting preserved
         
         For scanned pages:
-        - Uses PaddleOCR to extract text with bounding boxes
-        - Overlays translated text on top of the scanned image
+        - Uses RapidOCR for text extraction
+        - Creates clean page with translated text
         
         LINE-BY-LINE TRANSLATION (preserve_line_breaks=True):
         This mode translates each line independently, preserving the original
@@ -1370,11 +1320,20 @@ class PDFProcessor:
         is_scanned, scan_reason = self._is_likely_scanned_page(page)
         
         if is_scanned:
-            logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason}), using OCR translation mode")
-            return self._translate_scanned_page(
-                new_doc, page, page_num, translator, 
-                text_color, ocr_language
-            )
+            logging.info(f"Page {page_num + 1}: Detected as scanned ({scan_reason})")
+            # Prefer RapidDoc for structured output (headings, tables, reading order)
+            if RAPIDDOC_AVAILABLE:
+                logging.info(f"Page {page_num + 1}: Using RapidDoc for structured OCR translation")
+                return self._translate_scanned_page_rapiddoc(
+                    new_doc, page, page_num, translator,
+                    text_color, ocr_language
+                )
+            else:
+                logging.info(f"Page {page_num + 1}: Using RapidOCR translation mode (RapidDoc not available)")
+                return self._translate_scanned_page(
+                    new_doc, page, page_num, translator, 
+                    text_color, ocr_language
+                )
         
         text_dict = page.get_text("dict")
         
@@ -2285,7 +2244,7 @@ class PDFProcessor:
         if current_group:
             merged_groups.append(current_group)
         
-        logging.info(f"Cross-block merge: {len(text_blocks)} blocks → {len(merged_groups)} paragraph groups")
+        logging.info(f"Cross-block merge: {len(text_blocks)} blocks -> {len(merged_groups)} paragraph groups")
         
         return merged_groups
     
@@ -2515,5 +2474,10 @@ class PDFProcessor:
     
     @classmethod
     def get_ocr_language(cls, language_name: str) -> str:
-        """Get PaddleOCR language code from language name."""
-        return PADDLEOCR_LANGUAGES.get(language_name, "en")
+        """Get language code from language name.
+        
+        RapidOCR handles multiple languages. Returns a standard language
+        code for logging/reference purposes.
+        """
+        from .config import SUPPORTED_LANGUAGES
+        return SUPPORTED_LANGUAGES.get(language_name, "en")

@@ -3,9 +3,14 @@ OCR post-processing utilities.
 
 Functions for cleaning up OCR output, correcting common errors,
 and improving text quality.
+
+Note: Some corrections are domain-specific (legal distribution contracts:
+Article numbering, Exhibit references, Mimaki brand name). These are
+intentional for the primary use case but may cause false positives on
+unrelated document types.
 """
 import re
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 
 # ============================================
@@ -15,9 +20,18 @@ from typing import List, Dict, Tuple
 # Case-insensitive replacements for known OCR errors
 # Format: (wrong_pattern, correct_replacement)
 OCR_CORRECTIONS: List[Tuple[str, str]] = [
+    # --- Compound all-caps words that OCR merges ---
+    # These must come FIRST before word-level corrections
+    (r'AUTHORIZEDDISTRIBUTION', 'AUTHORIZED DISTRIBUTION'),
+    (r'DISTRIBUTIONAGREEMENT', 'DISTRIBUTION AGREEMENT'),
+    (r'AUTHORISEDDISTRIBUTOR', 'AUTHORISED DISTRIBUTOR'),
+    (r'NONCOMPETITION', 'NON-COMPETITION'),
+    
     # Mimaki brand - fix OCR errors while preserving case
     # All-caps variants (check full uppercase first)
     (r'\bMIMAKl\b', 'MIMAKI'),   # l misread as I
+    (r'\bMImakI\b', 'MIMAKI'),   # Mixed case
+    (r'\bMImaki\b', 'Mimaki'),   # MI→Mi at start
     # Title-case variants (uppercase M, lowercase rest except last char)
     (r'\bMimaKI\b', 'Mimaki'),   # Capital K followed by capital I
     (r'\bMimakI\b', 'Mimaki'),   # Capital I at end
@@ -35,13 +49,15 @@ OCR_CORRECTIONS: List[Tuple[str, str]] = [
     (r'\bnibit\b', 'Exhibit'),
     (r'\bNibit\b', 'Exhibit'),
     (r'\bibit\b', 'Exhibit'),
-    (r'\bExhibit\s*#\s*', 'Exhibit #'),  # Normalize spacing
+    # Normalize Exhibit# → Exhibit #
+    (r'\bExhibit\s*#\s*', 'Exhibit #'),
     
-    # Article/ICE confusion  
-    (r'\bICE\s+(\d+)\b', r'Article \1'),
-    (r'\bIce\s+(\d+)\b', r'Article \1'),
-    # Truncated "Article" (OCR sometimes misses "Artic")
-    (r'\ble\s+(\d+)\s*-', r'Article \1 -'),  # "le 4 -" -> "Article 4 -"
+    # Article/ICE confusion (domain-specific: legal contracts)
+    # Only match at line start or after period to reduce false positives
+    (r'(?:^|\.\s+)ICE\s+(\d+)\b', r'Article \1'),
+    # Missing space in "Article8" → "Article 8"
+    (r'\bArticle(\d+)\b', r'Article \1'),
+    (r'\bArticle\s*(\d+)\s*-\s*', r'Article \1 – '),  # Normalize dash to en-dash
     
     # Common word confusions
     (r'\bArtlcle\b', 'Article'),
@@ -56,17 +72,21 @@ OCR_CORRECTIONS: List[Tuple[str, str]] = [
     (r'\b5ection\b', 'Section'),
     (r'\b5igned\b', 'Signed'),
     
-    # Common ligature misreads
-    (r'\bff\b(?=[a-z])', 'ff'),  # ff at word start
-    (r'(?<=[a-z])ff\b', 'ff'),  # ff at word end
+    # Common ligature misreads — handle actual Unicode ligatures
+    (r'\ufb00', 'ff'),  # ﬀ ligature
+    (r'\ufb01', 'fi'),  # ﬁ ligature
+    (r'\ufb02', 'fl'),  # ﬂ ligature
+    
+    # Missing spaces in OCR-merged words (camelCase)
+    # Only split when both sides are at least 3 chars to avoid breaking
+    # proper names like "McDonald" or "MacArthur"
+    (r'(?<=[a-z]{3})(?=[A-Z][a-z]{2})', ' '),
+    
+    # Fix "Mimakis" (possessive without apostrophe) → "Mimaki's"
+    (r'\bMimakis\b', "Mimaki's"),
+    (r'\bMIMAKIS\b', "MIMAKI'S"),
 ]
 
-# Numbers that should remain as-is (don't correct these)
-PRESERVE_PATTERNS = [
-    r'\d+\.\d+',  # Decimal numbers
-    r'#\d+',      # Reference numbers
-    r'§\d+',      # Section symbols
-]
 
 
 def clean_ocr_text(text: str) -> str:
@@ -93,12 +113,18 @@ def clean_ocr_text(text: str) -> str:
     # Multiple dots (4+) are likely TOC leaders
     text = re.sub(r'\.{4,}', ' ... ', text)
     
-    # Clean up multiple spaces
-    text = re.sub(r'\s+', ' ', text)
+    # Clean up multiple horizontal spaces (preserve newlines for line-based filters)
+    text = re.sub(r'[^\S\n]+', ' ', text)
     
-    # Fix spacing around punctuation
-    text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+    # Collapse multiple blank lines into one paragraph break
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Fix spacing around punctuation (horizontal only, don't join lines)
+    text = re.sub(r' +([.,;:!?])', r'\1', text)
     text = re.sub(r'([.,;:!?])(?=[A-Za-z])', r'\1 ', text)
+    
+    # Strip trailing spaces per line
+    text = '\n'.join(line.rstrip() for line in text.split('\n'))
     
     return text.strip()
 
@@ -173,82 +199,14 @@ def normalize_whitespace(text: str) -> str:
     return '\n\n'.join(normalized)
 
 
-def detect_and_fix_columns(text_regions: List[Dict], page_width: float) -> List[Dict]:
-    """
-    Detect column layout and reorder text regions for proper reading order.
-    
-    Args:
-        text_regions: List of {'text': str, 'bbox': dict, ...}
-        page_width: Page width for column detection
-        
-    Returns:
-        Reordered text regions in reading order
-    """
-    if not text_regions:
-        return text_regions
-    
-    # Detect columns by clustering x positions
-    positioned = [r for r in text_regions if r.get('bbox')]
-    
-    if not positioned:
-        return text_regions
-    
-    # Find column boundaries using gap analysis
-    x_positions = sorted(set(r['bbox'].get('center_x', 0) for r in positioned))
-    
-    if len(x_positions) < 2:
-        return text_regions
-    
-    # Find large gaps (> 10% page width)
-    min_gap = page_width * 0.10
-    columns = []
-    current_col = [x_positions[0]]
-    
-    for i in range(1, len(x_positions)):
-        gap = x_positions[i] - x_positions[i-1]
-        if gap > min_gap:
-            columns.append(current_col)
-            current_col = [x_positions[i]]
-        else:
-            current_col.append(x_positions[i])
-    columns.append(current_col)
-    
-    if len(columns) <= 1:
-        # Single column - sort by y position
-        return sorted(text_regions, key=lambda r: r.get('bbox', {}).get('y0', 0))
-    
-    # Multi-column: assign regions to columns and sort
-    column_bounds = []
-    for col in columns:
-        col_min = min(col) - min_gap/2
-        col_max = max(col) + min_gap/2
-        column_bounds.append((col_min, col_max))
-    
-    # Assign and sort
-    result = []
-    for col_idx, (col_min, col_max) in enumerate(column_bounds):
-        col_regions = [
-            r for r in positioned 
-            if col_min <= r['bbox'].get('center_x', 0) <= col_max
-        ]
-        col_regions.sort(key=lambda r: r['bbox'].get('y0', 0))
-        result.extend(col_regions)
-    
-    # Add unpositioned regions at the end
-    unpositioned = [r for r in text_regions if not r.get('bbox')]
-    result.extend(unpositioned)
-    
-    return result
-
-
 def remove_page_artifacts(text: str) -> str:
     """
     Remove common page artifacts from OCR text.
     
-    Removes:
+    Removes only high-confidence noise:
     - Page numbers (standalone numbers)
-    - Headers/footers (repeated patterns)
-    - Watermarks
+    - Very short non-alpha noise
+    - Lines that are just punctuation
     """
     if not text:
         return text
@@ -257,21 +215,26 @@ def remove_page_artifacts(text: str) -> str:
     cleaned = []
     
     for line in lines:
-        line = line.strip()
+        stripped = line.strip()
         
-        # Skip standalone page numbers
-        if re.match(r'^[\d]+$', line):
+        # Preserve blank lines (they mark paragraph boundaries)
+        if not stripped:
+            cleaned.append('')
             continue
         
-        # Skip very short lines that look like headers
-        if len(line) < 3 and not line.isalpha():
+        # Skip standalone page numbers
+        if re.match(r'^[\d]+$', stripped):
+            continue
+        
+        # Skip very short lines that look like noise (but not short words)
+        if len(stripped) < 3 and not stripped.isalpha():
             continue
         
         # Skip lines that are just punctuation
-        if re.match(r'^[\W]+$', line):
+        if re.match(r'^[\W]+$', stripped):
             continue
         
-        cleaned.append(line)
+        cleaned.append(stripped)
     
     return '\n'.join(cleaned)
 

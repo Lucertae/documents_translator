@@ -1,6 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 LAC Translate - PyInstaller Build Specification (Windows & Linux)
+
+OCR Engine: GLM-OCR via Ollama (external server, not bundled)
+Ollama must be installed separately on the target system.
 """
 
 import sys
@@ -22,49 +25,14 @@ datas += collect_data_files('transformers', include_py_files=False)
 # SentencePiece
 datas += collect_data_files('sentencepiece', include_py_files=False)
 
-# PaddlePaddle - CRITICAL: include all data files and libs
+# Ollama Python client
 try:
-    datas += collect_data_files('paddle', include_py_files=True)
+    datas += collect_data_files('ollama', include_py_files=False)
 except Exception as e:
-    print(f"Warning: Could not collect paddle data files: {e}")
-
-# PaddleOCR resources
-try:
-    datas += collect_data_files('paddleocr', include_py_files=True)
-except Exception as e:
-    print(f"Warning: Could not collect paddleocr data files: {e}")
-
-# PaddleX resources (required by PaddleOCR v3+)
-try:
-    datas += collect_data_files('paddlex', include_py_files=True)
-except Exception as e:
-    print(f"Warning: Could not collect paddlex data files: {e}")
+    print(f"Warning: Could not collect ollama data files: {e}")
 
 # Collect binaries/dynamic libraries
 binaries = []
-
-# PaddlePaddle dynamic libraries (critical for Windows)
-try:
-    binaries += collect_dynamic_libs('paddle')
-except Exception as e:
-    print(f"Warning: Could not collect paddle dynamic libs: {e}")
-
-try:
-    binaries += collect_dynamic_libs('paddleocr')
-except Exception as e:
-    print(f"Warning: Could not collect paddleocr dynamic libs: {e}")
-
-# ONNX Runtime (required by PaddlePaddle inference)
-try:
-    binaries += collect_dynamic_libs('onnxruntime')
-except Exception as e:
-    print(f"Warning: Could not collect onnxruntime dynamic libs: {e}")
-
-# OpenCV binaries
-try:
-    binaries += collect_dynamic_libs('cv2')
-except Exception as e:
-    print(f"Warning: Could not collect cv2 dynamic libs: {e}")
 
 # Include app resources (with existence checks for CI compatibility)
 app_resources = [
@@ -103,58 +71,23 @@ hiddenimports = [
     # Image processing
     'PIL',
     'PIL.Image',
-    'pdf2image',
     
-    # PaddlePaddle - ALL required modules
-    'paddle',
-    'paddle.fluid',
-    'paddle.inference',
-    'paddle.base',
-    'paddle.framework',
-    'paddle.utils',
-    'paddle.device',
-    'paddle.nn',
-    'paddle.optimizer',
-    'paddle.io',
-    'paddle.vision',
-    'paddle.distributed',
+    # Ollama client
+    'ollama',
     
-    # PaddleOCR
-    'paddleocr',
-    'paddleocr.paddleocr',
-    
-    # PaddleX (required by PaddleOCR v3+)
-    'paddlex',
-    'paddlex.inference',
-    'paddlex.inference.pipelines',
-    'paddlex.inference.models',
-    'paddlex.modules',
-    
-    # OpenCV (used by PaddleOCR)
-    'cv2',
-    
-    # ONNX Runtime (required by PaddlePaddle inference)
-    'onnxruntime',
-    'onnxruntime.capi',
-    
-    # Numpy/Scipy
+    # Numpy
     'numpy',
-    'scipy',
-    'scipy.special',
     
-    # YAML (used by PaddleX configs)
-    'yaml',
-    'ruamel',
-    'ruamel.yaml',
-    
-    # Requests (for model downloads)
+    # Requests (for model downloads & Ollama API)
     'requests',
     'urllib3',
+    'httpx',
     
     # App modules
     'app.core',
     'app.core.pdf_processor',
     'app.core.translator',
+    'app.core.glm_ocr',
     'app.ui',
     'app.ui.main_window',
     'app.ui.pdf_viewer',
@@ -164,12 +97,6 @@ hiddenimports = [
 hiddenimports += collect_submodules('transformers')
 hiddenimports += collect_submodules('torch')
 hiddenimports += collect_submodules('PySide6')
-hiddenimports += collect_submodules('paddle')
-hiddenimports += collect_submodules('paddleocr')
-hiddenimports += collect_submodules('paddlex')
-hiddenimports += collect_submodules('scipy')
-hiddenimports += collect_submodules('onnxruntime')
-hiddenimports += collect_submodules('cv2')
 
 # Exclude unnecessary modules to reduce size
 excludes = [

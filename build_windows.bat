@@ -89,7 +89,7 @@ echo.
 REM ==========================================
 REM STEP 4: Verifica che PySide6 sia installato
 REM ==========================================
-echo [4/5] Verifico PySide6...
+echo [4/6] Verifico PySide6...
 
 python -c "import PySide6; print(f'    PySide6 versione: {PySide6.__version__}')" 2>nul
 if %errorlevel% neq 0 (
@@ -107,7 +107,7 @@ echo.
 REM ==========================================
 REM STEP 5: Build con PyInstaller
 REM ==========================================
-echo [5/5] Avvio build con PyInstaller...
+echo [5/6] Avvio build con PyInstaller...
 echo     Questo puo' richiedere 5-10 minuti...
 echo.
 
@@ -127,7 +127,7 @@ if %errorlevel% neq 0 (
 )
 
 REM ==========================================
-REM Verifica risultato
+REM STEP 6: Verifica risultato
 REM ==========================================
 if exist "dist\lac-translate\lac-translate.exe" (
     echo.

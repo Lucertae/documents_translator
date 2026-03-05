@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QPropertyAnimation, QEasingCurve, Property, QSize
 from PySide6.QtGui import QAction, QKeySequence, QFont, QColor, QPainter, QLinearGradient, QPainterPath, QIcon, QPen
 import logging
+import gc
 from pathlib import Path
 import pymupdf
 
@@ -1108,8 +1109,16 @@ class MainWindow(QMainWindow):
         source_code = "en" if source_lang == "Auto-Detect" else TranslationEngine.get_language_code(source_lang)
         target_code = TranslationEngine.get_language_code(target_lang)
         
+        # Prevent same source and target language
+        if source_code == target_code:
+            logging.warning(f"Same source and target language selected: {source_code}")
+            return
+        
         if self.translator:
-            self.translator.set_languages(source_code, target_code)
+            try:
+                self.translator.set_languages(source_code, target_code)
+            except ValueError as e:
+                logging.error(f"Failed to update translator: {e}")
     
     @Slot()
     def translate_current_page(self):
@@ -1153,6 +1162,9 @@ class MainWindow(QMainWindow):
         self.translated_pages[self.current_page] = translated_doc
         self.display_translated_page(self.current_page)
         self.translated_panel.set_active(True)
+        
+        # Force garbage collection to prevent memory buildup
+        gc.collect()
         
         self.progress_container.setVisible(False)
         self.status_bar.showMessage(
@@ -1299,6 +1311,9 @@ class MainWindow(QMainWindow):
                 if page_num == self.current_page:
                     self.display_translated_page(page_num)
                     self.translated_panel.set_active(True)
+                
+                # Force garbage collection to prevent memory buildup
+                gc.collect()
             except Exception as e:
                 logging.error(f"Failed to deserialize page {page_num + 1}: {e}")
         else:
