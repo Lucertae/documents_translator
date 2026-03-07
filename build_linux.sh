@@ -59,20 +59,59 @@ if [ -d "dist/lac-translate" ]; then
     
     # Show size
     SIZE=$(du -sh dist/lac-translate | cut -f1)
-    echo "📊 Total size: $SIZE"
+    EXEC_SIZE=$(du -sh dist/lac-translate/lac-translate | cut -f1)
+    echo "📊 Total size: $SIZE (executable: $EXEC_SIZE)"
     echo ""
+    
+    # Ensure executable permissions
+    chmod +x dist/lac-translate/lac-translate
     
     # Create run script
     cat > dist/lac-translate/run.sh << 'EOF'
 #!/bin/bash
+# LAC Translate - Professional PDF Translation
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-./lac-translate "$@"
+exec ./lac-translate "$@"
 EOF
     chmod +x dist/lac-translate/run.sh
-    chmod +x dist/lac-translate/lac-translate
     
-    echo "💡 You can also create a desktop shortcut or add to PATH"
+    # Generate .desktop entry with correct absolute path
+    INSTALL_DIR="$(cd dist/lac-translate && pwd)"
+    cat > dist/lac-translate/lac-translate.desktop << DEOF
+[Desktop Entry]
+Name=LAC Translate
+GenericName=PDF Translator
+Comment=Professional PDF translation with OCR support
+Exec=${INSTALL_DIR}/lac-translate
+Path=${INSTALL_DIR}
+Icon=${INSTALL_DIR}/_internal/assets/icon.png
+Terminal=false
+Type=Application
+Categories=Office;Translation;
+StartupNotify=true
+StartupWMClass=lac-translate
+DEOF
+    chmod +x dist/lac-translate/lac-translate.desktop
+    
+    # Create install helper
+    cat > dist/lac-translate/install-desktop.sh << 'IEOF'
+#!/bin/bash
+# Install desktop shortcut for LAC Translate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+mkdir -p "$DESKTOP_DIR"
+# Update paths in desktop file
+sed "s|Exec=.*|Exec=${SCRIPT_DIR}/lac-translate|; s|Path=.*|Path=${SCRIPT_DIR}|; s|Icon=.*|Icon=${SCRIPT_DIR}/_internal/assets/icon.png|" \
+    "${SCRIPT_DIR}/lac-translate.desktop" > "${DESKTOP_DIR}/lac-translate.desktop"
+chmod +x "${DESKTOP_DIR}/lac-translate.desktop"
+echo "✅ Desktop shortcut installed to ${DESKTOP_DIR}/lac-translate.desktop"
+echo "   You may need to log out and back in for it to appear in your menu."
+IEOF
+    chmod +x dist/lac-translate/install-desktop.sh
+    
+    echo "💡 To install as a desktop app, run:"
+    echo "   ./dist/lac-translate/install-desktop.sh"
 else
     echo ""
     echo "❌ BUILD FAILED!"

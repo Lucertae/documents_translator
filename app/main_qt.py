@@ -9,6 +9,7 @@ import atexit
 from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType
+from PySide6.QtGui import QIcon
 
 # Add parent directory to path for proper imports
 app_dir = Path(__file__).parent
@@ -107,6 +108,17 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setOrganizationName("LUCERTAE SRLS")
+    
+    # Set application icon
+    icon_path = Path(__file__).parent.parent / 'assets' / 'icon.png'
+    if not icon_path.exists():
+        # PyInstaller bundle: look in _internal/assets/
+        icon_path = Path(sys.executable).parent / '_internal' / 'assets' / 'icon.png'
+    if not icon_path.exists():
+        # Fallback: next to executable
+        icon_path = Path(sys.executable).parent / 'assets' / 'icon.png'
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     
     # Create and show main window
     window = MainWindow()

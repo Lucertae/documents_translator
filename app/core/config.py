@@ -156,17 +156,6 @@ SUPPORTED_LANGUAGES: Dict[str, str] = {
 # Text Normalization Maps
 # ============================================
 
-# Ligature replacements for PDF rendering
-LIGATURE_MAP: Dict[str, str] = {
-    '\ufb00': 'ff',
-    '\ufb01': 'fi',
-    '\ufb02': 'fl',
-    '\ufb03': 'ffi',
-    '\ufb04': 'ffl',
-    '\ufb05': 'ft',
-    '\ufb06': 'st',
-}
-
 # Typographic quotes to standard
 QUOTE_MAP: Dict[str, str] = {
     '\u201c': '"',  # Left double "
@@ -191,24 +180,6 @@ DASH_SPACE_MAP: Dict[str, str] = {
     '\u2003': ' ',  # Em space
     '\u2002': ' ',  # En space
     '\u2009': ' ',  # Thin space
-}
-
-
-# ============================================
-# Abbreviations (for sentence splitting)
-# ============================================
-
-ABBREVIATIONS = {
-    # English
-    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc', 'inc', 'ltd',
-    'fig', 'vol', 'no', 'pp', 'ed', 'eds', 'rev', 'col', 'gen', 'gov',
-    'hon', 'lt', 'sgt', 'rep', 'sen', 'st', 'co', 'corp', 'dept', 'div',
-    # Italian
-    'dott', 'sig', 'sig.ra', 'prof', 'avv', 'ing', 'arch', 'geom',
-    # German
-    'nr', 'str', 'tel', 'bzw',
-    # French
-    'av', 'bd', 'env', 'm', 'mme', 'mlle',
 }
 
 

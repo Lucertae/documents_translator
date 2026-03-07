@@ -176,6 +176,8 @@ class LineFormatInfo:
     merged_bbox: Tuple[float, float, float, float]
     rotation: int = 0
     wmode: int = 0
+    text_align: str = "left"  # "left", "justify", "center", "right"
+    indent: float = 0.0  # Left indentation offset in points (from page/column margin)
     
     @property
     def avg_size(self) -> float:
@@ -242,6 +244,7 @@ class LineFormatInfo:
         """
         Get list of (text, format) pairs for each span.
         Consecutive spans with same formatting are merged.
+        Uses smart spacing: only adds space if spans have a horizontal gap.
         """
         if not self.spans:
             return []
@@ -250,10 +253,20 @@ class LineFormatInfo:
         current_format = self.spans[0]
         current_text = self.spans[0].text
         
-        for span in self.spans[1:]:
+        for i, span in enumerate(self.spans[1:], 1):
+            # Determine if a space is needed between this span and previous
+            prev_span = self.spans[i - 1]
+            prev_right = prev_span.bbox[2]  # x1
+            curr_left = span.bbox[0]         # x0
+            gap = curr_left - prev_right
+            avg_char_w = prev_span.size * 0.3
+            
+            needs_space = gap >= avg_char_w and not prev_span.text.endswith(' ') and not span.text.startswith(' ')
+            separator = " " if needs_space else ""
+            
             if span.format_key() == current_format.format_key():
                 # Same formatting, merge text
-                current_text += " " + span.text
+                current_text += separator + span.text
             else:
                 # Different formatting, save current and start new
                 segments.append((current_text, current_format))
@@ -283,6 +296,8 @@ class LineFormatInfo:
             'is_monospace': self.is_monospace,
             'rotation': self.rotation,
             'wmode': self.wmode,
+            'text_align': self.text_align,
+            'indent': self.indent,
             'spans': self.spans,
             'has_mixed_formatting': self.has_mixed_formatting,
         }
