@@ -4,7 +4,6 @@ Text formatting utilities for PDF translation.
 Functions for mapping original formatting to translated text,
 HTML generation, and text normalization.
 """
-import re
 import unicodedata
 from html import escape as escape_html
 from typing import List, Tuple, Optional, Dict

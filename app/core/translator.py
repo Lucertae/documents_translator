@@ -8,16 +8,15 @@ Tokenization: SentencePiece (native, lightweight)
 Models: Helsinki-NLP OPUS-MT (auto-converted on first use)
 """
 import logging
-import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import ctranslate2
 import sentencepiece as spm
 
-from .sentry_integration import capture_exception, add_breadcrumb
+from .sentry_integration import capture_exception
 
 
 import pysbd

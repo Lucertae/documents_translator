@@ -15,17 +15,11 @@ OCR Engine: RapidOCR (ONNX Runtime + PP-OCRv4/v5)
 """
 import logging
 import math
-import io
-import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import pymupdf
 from PIL import Image
-import numpy as np
-
-# System imports
-import sys
 
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
@@ -36,8 +30,6 @@ from .config import (
     DEFAULT_TEXT_QUALITY_CONFIG,
     DEFAULT_SCAN_DETECTION_CONFIG,
     DEFAULT_PARAGRAPH_CONFIG,
-    QUOTE_MAP,
-    DASH_SPACE_MAP,
 )
 
 # Import formatting classes
@@ -54,7 +46,7 @@ from .format_utils import (
 from .ocr_utils import post_process_ocr_text
 
 # Import Sentry integration
-from .sentry_integration import capture_exception, add_breadcrumb, set_context
+from .sentry_integration import capture_exception
 
 # Import pymupdf4llm column detection (battle-tested multi-column layout analysis)
 try:
@@ -201,7 +193,7 @@ def _is_likely_footnote_marker(text: str, font_size: float, page_height: float, 
 
 # OCR integration via RapidOCR (ONNX Runtime)
 try:
-    from .rapid_ocr import RapidOcrEngine, check_ocr_status
+    from .rapid_ocr import RapidOcrEngine
     _ocr_engine_instance = RapidOcrEngine()
     OCR_AVAILABLE = _ocr_engine_instance.is_available()
     if not OCR_AVAILABLE:
@@ -213,7 +205,7 @@ except ImportError as e:
 
 # RapidDoc integration for structured document parsing (layout + OCR + table)
 try:
-    from .rapid_doc_engine import RapidDocEngine, check_rapiddoc_status
+    from .rapid_doc_engine import RapidDocEngine
     _rapiddoc_engine_instance = RapidDocEngine()
     RAPIDDOC_AVAILABLE = _rapiddoc_engine_instance.is_available()
     if RAPIDDOC_AVAILABLE:

@@ -11,7 +11,6 @@ Versioning follows Semantic Versioning (SemVer): MAJOR.MINOR.PATCH
 
 Pre-release tags: alpha, beta, rc (release candidate)
 """
-from datetime import datetime
 from typing import Dict, Any
 
 # ============================================

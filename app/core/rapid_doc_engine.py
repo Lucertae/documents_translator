@@ -23,7 +23,6 @@ Usage:
         markdown = engine.extract_page_markdown(pdf_bytes, page_num=0)
 """
 import os
-import io
 import logging
 import time
 from typing import Optional, Tuple, List, Dict, Any

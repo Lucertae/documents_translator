@@ -6,11 +6,11 @@ Premium interface for legal professionals and enterprises
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QFileDialog,
-    QMessageBox, QProgressBar, QSplitter, QFrame,
-    QStatusBar, QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy
+    QMessageBox, QProgressBar, QFrame,
+    QStatusBar
 )
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QPropertyAnimation, QEasingCurve, Property, QSize
-from PySide6.QtGui import QAction, QKeySequence, QFont, QColor, QPainter, QLinearGradient, QPainterPath, QIcon, QPen
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtGui import QAction, QKeySequence
 import logging
 import gc
 from pathlib import Path
