@@ -1,45 +1,94 @@
 """
-Core translation module - CTranslate2 Edition
-High-performance offline translation using Helsinki-NLP OPUS-MT models
-converted to CTranslate2 INT8 format for 2-4x faster CPU inference.
-
-Inference: CTranslate2 (optimized C++ engine, INT8 quantization)
-Tokenization: SentencePiece (native, lightweight)
-Models: Helsinki-NLP OPUS-MT (auto-converted on first use)
+Core translation module - OPUS-MT Edition
+World-class translation using Helsinki-NLP OPUS-MT models.
+Lightweight (~300MB per language pair), fast, and superior quality to Argos.
+Completely offline for privacy and security.
 """
 import logging
 import re
-import shutil
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-import ctranslate2
-import sentencepiece as spm
+import unicodedata
+from typing import Optional, Dict, List, Tuple
+from transformers import MarianMTModel, MarianTokenizer
+import torch
 
 from .sentry_integration import capture_exception
 
 
-import pysbd
-
-
 def split_into_sentences(text: str) -> List[str]:
     """
-    Split text into sentences using pysbd (pragma sentence boundary detection).
-
-    Handles abbreviations, numbers, quotations, and multiple languages
-    out of the box — battle-tested on 100+ edge cases across languages.
-
+    Split text into sentences using intelligent boundary detection.
+    
+    Handles:
+    - Standard punctuation (. ! ?)
+    - Abbreviations (Mr., Dr., etc.)
+    - Numbers with decimals
+    - Quotations
+    - Multiple languages
+    
     Returns:
-        List of sentences (non-empty)
+        List of sentences
     """
     if not text or not text.strip():
         return []
-
-    segmenter = pysbd.Segmenter(language="en", clean=False)
-    sentences = segmenter.segment(text.strip())
-
-    # Filter out empty/whitespace-only segments
-    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    # Common abbreviations that don't end sentences
+    abbreviations = {
+        'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc', 'inc', 'ltd',
+        'fig', 'vol', 'no', 'pp', 'ed', 'eds', 'rev', 'col', 'gen', 'gov',
+        'hon', 'lt', 'sgt', 'rep', 'sen', 'st', 'co', 'corp', 'dept', 'div',
+        # Italian
+        'dott', 'sig', 'sig.ra', 'prof', 'avv', 'ing', 'arch', 'geom',
+        # German
+        'nr', 'str', 'tel', 'bzw',
+        # French  
+        'av', 'bd', 'env', 'm', 'mme', 'mlle',
+    }
+    
+    # Pattern to find potential sentence boundaries
+    # Matches: . ! ? followed by space and uppercase letter, or end of string
+    sentence_end_pattern = re.compile(
+        r'([.!?])'  # Punctuation
+        r'(\s+)'    # Whitespace
+        r'(?=[A-ZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜ]|$)'  # Followed by uppercase or end
+    )
+    
+    # First pass: mark potential boundaries
+    sentences = []
+    current = []
+    words = text.split()
+    
+    for i, word in enumerate(words):
+        current.append(word)
+        
+        # Check if word ends with sentence-ending punctuation
+        if word and word[-1] in '.!?':
+            # Check if it's an abbreviation
+            clean_word = word.rstrip('.!?').lower()
+            
+            # Don't split on abbreviations
+            if clean_word in abbreviations:
+                continue
+            
+            # Don't split on single letters (initials like "J.")
+            if len(clean_word) == 1:
+                continue
+            
+            # Don't split on numbers (like "3.14" or "2.")
+            if clean_word.replace(',', '').replace('.', '').isdigit():
+                continue
+            
+            # This looks like a real sentence boundary
+            sentence = ' '.join(current)
+            if sentence.strip():
+                sentences.append(sentence.strip())
+            current = []
+    
+    # Don't forget remaining text
+    if current:
+        remaining = ' '.join(current)
+        if remaining.strip():
+            sentences.append(remaining.strip())
+    
     return sentences if sentences else [text.strip()]
 
 
@@ -174,19 +223,18 @@ def _distribute_single_sentence(
 
 class TranslationEngine:
     """
-    High-performance translation engine using CTranslate2 + OPUS-MT.
-
-    Models are automatically converted from HuggingFace format to
-    CTranslate2 INT8 format on first use (requires torch+transformers).
-    Subsequent loads are near-instant and use only CTranslate2 + SentencePiece.
-
-    Advantages over raw PyTorch inference:
-    - 2-4x faster on CPU (optimized C++ kernels)
-    - ~4x less runtime memory (INT8 quantization)
-    - Simpler inference path (no torch context managers)
-    - Same BLEU quality (INT8 is effectively lossless for MT)
+    Professional translation engine using Helsinki-NLP OPUS-MT models.
+    
+    Advantages:
+    - Much lighter than NLLB-200 (300MB vs 2.5GB)
+    - Faster translation (optimized for CPU)
+    - Better quality than Argos Translate
+    - Specialized models per language pair (better accuracy)
+    - Completely offline
+    
+    Models: Helsinki-NLP/opus-mt-{src}-{tgt}
     """
-
+    
     # OPUS-MT model mapping for supported languages
     OPUS_MODEL_MAP = {
         ("en", "it"): "Helsinki-NLP/opus-mt-en-it",
@@ -202,12 +250,7 @@ class TranslationEngine:
         ("en", "nl"): "Helsinki-NLP/opus-mt-en-nl",
         ("nl", "en"): "Helsinki-NLP/opus-mt-nl-en",
     }
-
-    # Multi-target models need a target language prefix token
-    _TARGET_PREFIX: Dict[tuple, str] = {
-        ("en", "pt"): ">>por<<",
-    }
-
+    
     SUPPORTED_LANGUAGES = {
         "Italiano": "it",
         "English": "en",
@@ -217,132 +260,92 @@ class TranslationEngine:
         "Português": "pt",
         "Nederlands": "nl",
     }
-
-    # CT2 model cache: lang_pair -> (Translator, sp_source, sp_target)
+    
+    # Cache for loaded models (singleton per language pair)
+    # Max 4 models to limit memory usage (~1.2GB for 4 models)
     _model_cache: Dict[tuple, tuple] = {}
-    _model_cache_order: list = []
+    _model_cache_order: list = []  # Track insertion order for LRU eviction
     _MAX_CACHED_MODELS = 4
-
-    # Directory for converted CT2 models (persistent across runs)
-    _CT2_MODELS_DIR = Path.home() / ".cache" / "lac-translate" / "ct2-models"
-
+    _device = None
+    
     def __init__(self, source_lang: str = "en", target_lang: str = "it"):
-        """Initialize translation engine with CTranslate2 + OPUS-MT."""
+        """
+        Initialize translation engine with OPUS-MT.
+        
+        Args:
+            source_lang: Source language code (ISO 639-1)
+            target_lang: Target language code (ISO 639-1)
+        """
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self._ensure_model(source_lang, target_lang)
-
-    # ------------------------------------------------------------------
-    # Model management
-    # ------------------------------------------------------------------
-
+        
+        # Setup device once
+        if TranslationEngine._device is None:
+            TranslationEngine._device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self._load_model(source_lang, target_lang)
+        
     @classmethod
-    def _get_ct2_path(cls, source_lang: str, target_lang: str) -> Path:
-        """Return the on-disk path for a converted CT2 model."""
-        return cls._CT2_MODELS_DIR / f"{source_lang}-{target_lang}"
-
-    @classmethod
-    def _ensure_model(cls, source_lang: str, target_lang: str):
-        """Ensure CT2 model is converted, loaded, and cached."""
+    def _load_model(cls, source_lang: str, target_lang: str):
+        """Load OPUS-MT model for specific language pair (lazy initialization with LRU caching)."""
         lang_pair = (source_lang, target_lang)
-
-        # Return cached model (move to end for LRU)
+        
+        # Return cached model if available (and move to end for LRU)
         if lang_pair in cls._model_cache:
-            logging.debug(f"Using cached CT2 model: {source_lang} -> {target_lang}")
+            logging.debug(f"Using cached OPUS-MT model: {source_lang} -> {target_lang}")
+            # Move to end of order (most recently used)
             if lang_pair in cls._model_cache_order:
                 cls._model_cache_order.remove(lang_pair)
             cls._model_cache_order.append(lang_pair)
             return
-
+        
         # Evict oldest model if cache is full
         while len(cls._model_cache) >= cls._MAX_CACHED_MODELS:
             if cls._model_cache_order:
                 oldest = cls._model_cache_order.pop(0)
-                cls._model_cache.pop(oldest, None)
-                logging.info(f"Evicted cached model: {oldest[0]} -> {oldest[1]}")
-
-        hf_name = cls.OPUS_MODEL_MAP.get(lang_pair)
-        if not hf_name:
+                if oldest in cls._model_cache:
+                    del cls._model_cache[oldest]
+                    logging.info(f"Evicted cached model: {oldest[0]} -> {oldest[1]}")
+        
+        # Get model name for this language pair
+        model_name = cls.OPUS_MODEL_MAP.get(lang_pair)
+        
+        if not model_name:
+            logging.warning(f"No OPUS-MT model for {source_lang} -> {target_lang}")
             raise ValueError(f"Language pair not supported: {source_lang} -> {target_lang}")
-
-        ct2_path = cls._get_ct2_path(source_lang, target_lang)
-
-        # One-time conversion from HuggingFace → CTranslate2 INT8
-        if not (ct2_path / "model.bin").exists():
-            cls._convert_model(hf_name, ct2_path)
-
-        # Load CT2 translator
-        logging.info(f"Loading CT2 model: {source_lang} -> {target_lang}")
-        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-
+        
+        logging.info(f"Loading OPUS-MT model: {model_name}...")
+        
         try:
-            translator = ctranslate2.Translator(
-                str(ct2_path), device=device, compute_type="int8"
-            )
-
-            sp_source = spm.SentencePieceProcessor(str(ct2_path / "source.spm"))
-            sp_target = spm.SentencePieceProcessor(str(ct2_path / "target.spm"))
-
-            cls._model_cache[lang_pair] = (translator, sp_source, sp_target)
+            # Load model and tokenizer
+            tokenizer = MarianTokenizer.from_pretrained(model_name)
+            model = MarianMTModel.from_pretrained(model_name)
+            model.to(cls._device)
+            model.eval()
+            
+            # Cache the model and track order
+            cls._model_cache[lang_pair] = (model, tokenizer)
             cls._model_cache_order.append(lang_pair)
-
-            logging.info(
-                f"[OK] CT2 model loaded: {source_lang} -> {target_lang} "
-                f"(device={device}, cache={len(cls._model_cache)}/{cls._MAX_CACHED_MODELS})"
-            )
+            
+            logging.info(f"[OK] OPUS-MT model loaded: {source_lang} -> {target_lang} (cache: {len(cls._model_cache)}/{cls._MAX_CACHED_MODELS})")
+            
         except Exception as e:
             capture_exception(e, context={
-                "operation": "load_ct2_model",
-                "ct2_path": str(ct2_path),
+                "operation": "load_opus_model",
+                "model_name": model_name,
                 "source_lang": source_lang,
                 "target_lang": target_lang,
             }, tags={"component": "translator"})
-            logging.error(f"Failed to load CT2 model: {e}")
+            logging.error(f"Failed to load OPUS-MT model: {e}")
             raise
-
-    @classmethod
-    def _convert_model(cls, hf_model_name: str, output_dir: Path):
-        """
-        One-time conversion from HuggingFace OPUS-MT to CTranslate2 INT8.
-
-        This imports torch + transformers lazily (only during conversion).
-        After conversion, inference uses only ctranslate2 + sentencepiece.
-        """
-        logging.info(f"Converting {hf_model_name} -> CTranslate2 INT8 (one-time)...")
-        output_dir.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            converter = ctranslate2.converters.TransformersConverter(hf_model_name)
-            converter.convert(str(output_dir), quantization="int8")
-
-            # Ensure SentencePiece models are in the output directory
-            # (CT2 converter copies them, but verify and fetch from HF if missing)
-            for spm_name in ("source.spm", "target.spm"):
-                if not (output_dir / spm_name).exists():
-                    from huggingface_hub import hf_hub_download
-                    spm_path = hf_hub_download(hf_model_name, spm_name)
-                    shutil.copy2(spm_path, output_dir / spm_name)
-
-            logging.info(f"[OK] Model converted: {output_dir}")
-
-        except Exception as e:
-            capture_exception(e, context={
-                "operation": "convert_model",
-                "hf_model": hf_model_name,
-            }, tags={"component": "translator"})
-            # Clean up partial conversion
-            if output_dir.exists():
-                shutil.rmtree(output_dir, ignore_errors=True)
-            logging.error(f"Model conversion failed: {e}")
-            raise
-
+    
     @classmethod
     def clear_cache(cls):
         """Clear all cached models to free memory."""
         cls._model_cache.clear()
         cls._model_cache_order.clear()
         logging.info("Translation model cache cleared")
-
+    
     @classmethod
     def get_cache_info(cls) -> dict:
         """Get information about cached models."""
@@ -351,29 +354,26 @@ class TranslationEngine:
             "count": len(cls._model_cache),
             "max_size": cls._MAX_CACHED_MODELS,
         }
-
+    
     def _get_model(self):
-        """Get the (translator, sp_source, sp_target) for current language pair."""
+        """Get the model and tokenizer for current language pair."""
         lang_pair = (self.source_lang, self.target_lang)
+        
         if lang_pair not in self._model_cache:
-            self._ensure_model(self.source_lang, self.target_lang)
+            self._load_model(self.source_lang, self.target_lang)
+        
         return self._model_cache[lang_pair]
-
-    # ------------------------------------------------------------------
-    # Text pre/post-processing
-    # ------------------------------------------------------------------
-
+    
     def _normalize_for_translation(self, text: str) -> str:
         """
-        Normalize Unicode characters that SentencePiece may map to <unk>.
-
-        Uses NFKC for ligatures/spaces, then explicit maps for quotes/dashes.
+        Normalize Unicode characters that the OPUS-MT tokenizer can't handle.
+        
+        Uses NFKC for ligatures (ﬁ→fi, ﬂ→fl), ellipsis (…→...), and special spaces,
+        then explicit maps for smart quotes and dashes that NFKC doesn't touch.
         """
-        import unicodedata
-
-        # NFKC decomposes ligatures (ﬁ→fi), ellipsis (…→...), special spaces
+        # NFKC decomposes ligatures, ellipsis, special spaces (NBSP, etc.)
         text = unicodedata.normalize('NFKC', text)
-
+        
         # Curly/smart quotes → straight quotes (not handled by NFKC)
         text = text.replace('\u201c', '"')  # " left double
         text = text.replace('\u201d', '"')  # " right double
@@ -385,42 +385,52 @@ class TranslationEngine:
         text = text.replace('\u00bb', '"')  # » guillemet right
         text = text.replace('\u2039', "'")  # ‹ single guillemet left
         text = text.replace('\u203a', "'")  # › single guillemet right
-
+        
         # Dashes → ASCII hyphen (not handled by NFKC)
         text = text.replace('\u2013', '-')  # – en-dash
         text = text.replace('\u2014', '-')  # — em-dash
         text = text.replace('\u2212', '-')  # − minus sign
-
+        
         return text
-
-    def _protect_urls(self, text: str) -> Tuple[str, dict]:
+    
+    def _protect_urls(self, text: str) -> tuple[str, dict]:
         """
         Extract and protect URLs from being translated.
-
+        
         URLs confuse the translation model and can cause hallucinations.
-        Replaces them with bracketed placeholders that models tend to preserve.
+        We use XML-like tags that the model will preserve.
+        
+        Returns:
+            Tuple of (text with placeholders, dict mapping placeholder to URL)
         """
+        import re
+        
+        # Pattern to match URLs
         url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+        
         placeholders = {}
-        counter = [0]
-
+        counter = [0]  # Use list for closure modification
+        
         def replace_url(match):
             url = match.group(0)
+            # Use format that models typically preserve: quoted strings or brackets
             placeholder = f'[URL{counter[0]}]'
             placeholders[placeholder] = url
             counter[0] += 1
             return placeholder
-
+        
         protected_text = re.sub(url_pattern, replace_url, text)
         return protected_text, placeholders
-
+    
     def _restore_urls(self, text: str, placeholders: dict) -> str:
         """Restore URLs from placeholders after translation."""
+        import re
         for placeholder, url in placeholders.items():
+            # Try exact match first
             if placeholder in text:
                 text = text.replace(placeholder, url)
             else:
-                # Try variations the model may have introduced
+                # Try variations: [URL0], [ URL0 ], URL0, etc.
                 base = placeholder.strip('[]')
                 patterns = [
                     re.escape(placeholder),
@@ -434,66 +444,69 @@ class TranslationEngine:
                         break
         return text
 
-    # ------------------------------------------------------------------
-    # Translation
-    # ------------------------------------------------------------------
-
     def translate(self, text: str, max_length: int = 512) -> str:
         """
-        Translate text using CTranslate2 + OPUS-MT.
-
+        Translate text using OPUS-MT with superior quality and speed.
+        
         Args:
             text: Text to translate
-            max_length: Maximum output token length (default 512)
-
+            max_length: Maximum token length (default 512)
+            
         Returns:
-            Translated text
+            Translated text with guaranteed completeness
         """
         if not text or len(text.strip()) < 2:
             return text
-
-        # Protect URLs (they cause hallucinations)
+        
+        # Protect URLs from being translated (they cause hallucinations)
         text, url_placeholders = self._protect_urls(text)
-
-        # Normalize problematic Unicode
+        
+        # Normalize text to avoid <unk> tokens that cause truncation
         text = self._normalize_for_translation(text)
-
+        
         try:
-            translator, sp_source, sp_target = self._get_model()
-
-            # Tokenize with SentencePiece
-            tokens = sp_source.encode(text, out_type=str)
-
-            # Prepend target language prefix for multi-target models
-            prefix = self._TARGET_PREFIX.get((self.source_lang, self.target_lang))
-            if prefix:
-                tokens = [prefix] + tokens
-
-            # Translate with CTranslate2
-            results = translator.translate_batch(
-                [tokens],
-                beam_size=4,
-                max_decoding_length=max_length,
-            )
-
-            # Detokenize
-            output_tokens = results[0].hypotheses[0]
-            translation = sp_target.decode(output_tokens)
-
+            # Get model and tokenizer for this language pair
+            model, tokenizer = self._get_model()
+            
+            # Tokenize input
+            inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length
+            ).to(self._device)
+            
+            # Generate translation
+            with torch.no_grad():
+                translated_tokens = model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    num_beams=4,  # Beam search for quality
+                    early_stopping=True
+                )
+            
+            # Decode translation
+            translation = tokenizer.batch_decode(
+                translated_tokens,
+                skip_special_tokens=True
+            )[0]
+            
             # Restore protected URLs
             translation = self._restore_urls(translation, url_placeholders)
-
+            
             # Quality logging
             original_words = len(text.split())
             translated_words = len(translation.split())
             ratio = translated_words / original_words if original_words > 0 else 1.0
+            
             logging.debug(
-                f"CT2: '{text[:50]}...' ({original_words}w) -> "
+                f"OPUS-MT: '{text[:50]}...' ({original_words}w) -> "
                 f"'{translation[:50]}...' ({translated_words}w, {ratio:.1%})"
             )
-
+            
             return translation
-
+            
         except Exception as e:
             capture_exception(e, context={
                 "operation": "translate",
@@ -501,22 +514,22 @@ class TranslationEngine:
                 "source_lang": self.source_lang,
                 "target_lang": self.target_lang,
             }, tags={"component": "translator"})
-            logging.error(f"CT2 translation failed: {e}")
+            logging.error(f"OPUS-MT translation failed: {e}")
             return text
-
+    
     def set_languages(self, source_lang: str, target_lang: str) -> None:
         """Update source and target languages (loads new model if needed)."""
         if (source_lang, target_lang) != (self.source_lang, self.target_lang):
             self.source_lang = source_lang
             self.target_lang = target_lang
-            self._ensure_model(source_lang, target_lang)
+            self._load_model(source_lang, target_lang)
             logging.info(f"Languages updated: {source_lang} -> {target_lang}")
-
+    
     @classmethod
     def get_language_code(cls, language_name: str) -> str:
         """Get ISO 639-1 code from language name."""
         return cls.SUPPORTED_LANGUAGES.get(language_name, "en")
-
+    
     @classmethod
     def get_supported_languages(cls) -> list:
         """Get list of supported language names."""

@@ -5,8 +5,13 @@ Functions for mapping original formatting to translated text,
 HTML generation, and text normalization.
 """
 import unicodedata
-from html import escape as escape_html
+from functools import partial
+from html import escape as _html_escape
 from typing import List, Tuple, Optional, Dict
+
+# Don't escape single quotes — Italian text is full of apostrophes (l'accordo, c'è, dell'Italia)
+# The original custom escape_html only escaped &, <, >, " — NOT '
+escape_html = partial(_html_escape, quote=False)
 
 from .formatting import SpanFormat
 from .config import QUOTE_MAP, DASH_SPACE_MAP
