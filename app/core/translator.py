@@ -6,11 +6,12 @@ Completely offline for privacy and security.
 """
 import logging
 import re
+import unicodedata
 from typing import Optional, Dict, List, Tuple
 from transformers import MarianMTModel, MarianTokenizer
 import torch
 
-from .sentry_integration import capture_exception, add_breadcrumb
+from .sentry_integration import capture_exception
 
 
 def split_into_sentences(text: str) -> List[str]:
@@ -367,18 +368,13 @@ class TranslationEngine:
         """
         Normalize Unicode characters that the OPUS-MT tokenizer can't handle.
         
-        The OPUS-MT tokenizer (SentencePiece) converts certain Unicode characters
-        to <unk> tokens, which causes the model to truncate output. This method
-        converts problematic characters to ASCII equivalents before tokenization.
-        
-        Args:
-            text: Input text with potential Unicode characters
-            
-        Returns:
-            Normalized text safe for OPUS-MT tokenization
+        Uses NFKC for ligatures (ﬁ→fi, ﬂ→fl), ellipsis (…→...), and special spaces,
+        then explicit maps for smart quotes and dashes that NFKC doesn't touch.
         """
-        # Curly/smart quotes → straight quotes
-        # Using explicit Unicode escapes to ensure correct replacement
+        # NFKC decomposes ligatures, ellipsis, special spaces (NBSP, etc.)
+        text = unicodedata.normalize('NFKC', text)
+        
+        # Curly/smart quotes → straight quotes (not handled by NFKC)
         text = text.replace('\u201c', '"')  # " left double
         text = text.replace('\u201d', '"')  # " right double
         text = text.replace('\u2018', "'")  # ' left single
@@ -390,26 +386,10 @@ class TranslationEngine:
         text = text.replace('\u2039', "'")  # ‹ single guillemet left
         text = text.replace('\u203a', "'")  # › single guillemet right
         
-        # Dashes → ASCII hyphen
+        # Dashes → ASCII hyphen (not handled by NFKC)
         text = text.replace('\u2013', '-')  # – en-dash
         text = text.replace('\u2014', '-')  # — em-dash
         text = text.replace('\u2212', '-')  # − minus sign
-        
-        # Ellipsis → three dots
-        text = text.replace('\u2026', '...')  # …
-        
-        # Common ligatures → separated characters
-        text = text.replace('\ufb01', 'fi')  # ﬁ
-        text = text.replace('\ufb02', 'fl')  # ﬂ
-        text = text.replace('\ufb00', 'ff')  # ﬀ
-        text = text.replace('\ufb03', 'ffi')  # ﬃ
-        text = text.replace('\ufb04', 'ffl')  # ﬄ
-        
-        # Spaces
-        text = text.replace('\u00a0', ' ')  # Non-breaking space
-        text = text.replace('\u2002', ' ')  # En space
-        text = text.replace('\u2003', ' ')  # Em space
-        text = text.replace('\u2009', ' ')  # Thin space
         
         return text
     

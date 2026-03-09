@@ -30,8 +30,7 @@ import sys
 import logging
 import platform
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable
-from functools import wraps
+from typing import Optional, Dict, Any
 
 # Lazy import sentry_sdk to avoid import errors if not installed
 _sentry_sdk = None
@@ -488,8 +487,6 @@ __all__ = [
     "capture_exception",
     "capture_message",
     "add_breadcrumb",
-    "track_pdf_operation",
-    "track_translation",
     "set_user",
     "set_tag",
     "set_context",

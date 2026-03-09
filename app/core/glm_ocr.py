@@ -35,7 +35,6 @@ from .sentry_integration import capture_exception
 
 # Try to import ollama
 try:
-    import ollama
     from ollama import Client, ResponseError
     OLLAMA_AVAILABLE = True
 except ImportError:

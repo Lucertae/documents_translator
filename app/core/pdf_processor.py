@@ -15,17 +15,11 @@ OCR Engine: RapidOCR (ONNX Runtime + PP-OCRv4/v5)
 """
 import logging
 import math
-import io
-import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import pymupdf
 from PIL import Image
-import numpy as np
-
-# System imports
-import sys
 
 # Import sentence-aware translation helpers
 from .translator import split_into_sentences, align_sentences_to_lines
@@ -36,9 +30,6 @@ from .config import (
     DEFAULT_TEXT_QUALITY_CONFIG,
     DEFAULT_SCAN_DETECTION_CONFIG,
     DEFAULT_PARAGRAPH_CONFIG,
-    LIGATURE_MAP,
-    QUOTE_MAP,
-    DASH_SPACE_MAP,
 )
 
 # Import formatting classes
@@ -55,7 +46,23 @@ from .format_utils import (
 from .ocr_utils import post_process_ocr_text
 
 # Import Sentry integration
-from .sentry_integration import capture_exception, add_breadcrumb, set_context
+from .sentry_integration import capture_exception
+
+# Import pymupdf4llm column detection (battle-tested multi-column layout analysis)
+try:
+    from pymupdf4llm.helpers.multi_column import column_boxes
+    COLUMN_BOXES_AVAILABLE = True
+except ImportError:
+    COLUMN_BOXES_AVAILABLE = False
+    logging.warning("pymupdf4llm not available — falling back to heuristic block merging")
+
+# Import pymupdf4llm heading detection (document-level font-size analysis)
+try:
+    from pymupdf4llm import IdentifyHeaders
+    IDENTIFY_HEADERS_AVAILABLE = True
+except ImportError:
+    IDENTIFY_HEADERS_AVAILABLE = False
+    logging.warning("pymupdf4llm.IdentifyHeaders not available — using heuristic heading detection")
 
 
 # NOTE: SpanFormat and LineFormatInfo classes moved to formatting.py
@@ -63,9 +70,138 @@ from .sentry_integration import capture_exception, add_breadcrumb, set_context
 # NOTE: detect_title_or_heading moved to format_utils.py (simplified version)
 
 
+def _detect_page_alignment(text_dict: dict, page_width: float) -> dict:
+    """
+    Detect text alignment at the page level by analyzing line bounding boxes.
+    
+    Returns a dict with:
+        - 'alignment': 'left', 'justify', 'center', or 'right'
+        - 'left_margin': most common left x position
+        - 'right_margin': most common right x position
+        - 'indent_x0s': set of common x0 positions (for indentation detection)
+    """
+    from collections import Counter
+    
+    left_edges = []
+    right_edges = []
+    
+    for block in text_dict.get("blocks", []):
+        if "lines" not in block:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            line_text = "".join(s.get("text", "") for s in spans).strip()
+            # Skip very short lines (titles, list items, etc.)
+            if len(line_text) < 30:
+                continue
+            bbox = line.get("bbox", (0, 0, 0, 0))
+            left_edges.append(round(bbox[0], 0))
+            right_edges.append(round(bbox[2], 0))
+    
+    result = {
+        'alignment': 'left',
+        'left_margin': 0,
+        'right_margin': page_width,
+        'indent_x0s': set(),
+    }
+    
+    if not left_edges or not right_edges:
+        return result
+    
+    left_counts = Counter(left_edges)
+    right_counts = Counter(right_edges)
+    
+    most_common_left = left_counts.most_common(1)[0][0]
+    most_common_right = right_counts.most_common(1)[0][0]
+    
+    result['left_margin'] = most_common_left
+    result['right_margin'] = most_common_right
+    
+    # Collect all unique x0 positions for indentation tracking
+    all_x0_counts = Counter(round(bbox[0], 0) for block in text_dict.get("blocks", [])
+                            if "lines" in block
+                            for line in block.get("lines", [])
+                            for bbox in [line.get("bbox", (0, 0, 0, 0))]
+                            if "".join(s.get("text", "") for s in line.get("spans", [])).strip())
+    result['indent_x0s'] = set(all_x0_counts.keys())
+    
+    # Calculate right-edge standard deviation to detect justification
+    if len(right_edges) >= 3:
+        mean_right = sum(right_edges) / len(right_edges)
+        right_std = (sum((r - mean_right)**2 for r in right_edges) / len(right_edges)) ** 0.5
+        
+        if right_std < 10:
+            result['alignment'] = 'justify'
+        elif right_std < 25:
+            # Check if most lines reach close to the right margin
+            close_to_margin = sum(1 for r in right_edges if abs(r - most_common_right) < 15)
+            if close_to_margin > len(right_edges) * 0.6:
+                result['alignment'] = 'justify'
+    
+    return result
+
+
+# Bullet/list patterns for structural detection
+_LIST_PATTERNS = [
+    re.compile(r'^[•●○◦▪▸▹–—]\s'),           # Unicode bullets
+    re.compile(r'^-\s(?![0-9])'),               # Hyphen bullet (but not negative numbers)
+    re.compile(r'^\d{1,3}[.)]\s'),              # Numbered list: "1. " or "1) "
+    re.compile(r'^[a-z][.)]\s'),                # Lettered: "a) " or "a. "
+    re.compile(r'^[A-Z][.)]\s(?![A-Z])'),       # Cap lettered: "A) " (but not abbreviations)
+    re.compile(r'^(?:i{1,3}|iv|vi{0,3}|ix|x)[.)]\s', re.IGNORECASE),  # Roman numerals
+    re.compile(r'^\(\d{1,3}\)\s'),              # Parenthesized number: "(1) "
+    re.compile(r'^\([a-z]\)\s'),                # Parenthesized letter: "(a) "
+]
+
+
+def _is_list_item(text: str) -> bool:
+    """Check if text starts with a bullet or list marker."""
+    text = text.strip()
+    return any(pat.match(text) for pat in _LIST_PATTERNS)
+
+
+def _extract_list_prefix(text: str) -> tuple:
+    """
+    Extract list prefix from text if it's a list item.
+    
+    Returns (prefix, body) or (None, text) if not a list item.
+    """
+    text = text.strip()
+    for pat in _LIST_PATTERNS:
+        m = pat.match(text)
+        if m:
+            return text[:m.end()], text[m.end():]
+    return None, text
+
+
+def _is_likely_footnote_marker(text: str, font_size: float, page_height: float, y_pos: float) -> bool:
+    """
+    Improved footnote detection. A line is a footnote reference only if:
+    - It starts with a number followed by space
+    - AND (font is smaller than body text OR it's in the bottom 30% of the page)
+    - AND the number is reasonable (1-99)
+    
+    This prevents false positives on normal text starting with numbers
+    like "3 main points" or "2020 was a leap year".
+    """
+    m = re.match(r'^(\d{1,2})\s', text.strip())
+    if not m:
+        return False
+    
+    num = int(m.group(1))
+    if num < 1 or num > 99:
+        return False
+    
+    # Must be either small font or at bottom of page
+    is_small_font = font_size < 9.5
+    is_bottom_of_page = y_pos > page_height * 0.70
+    
+    return is_small_font or is_bottom_of_page
+
+
 # OCR integration via RapidOCR (ONNX Runtime)
 try:
-    from .rapid_ocr import RapidOcrEngine, check_ocr_status
+    from .rapid_ocr import RapidOcrEngine
     _ocr_engine_instance = RapidOcrEngine()
     OCR_AVAILABLE = _ocr_engine_instance.is_available()
     if not OCR_AVAILABLE:
@@ -77,7 +213,7 @@ except ImportError as e:
 
 # RapidDoc integration for structured document parsing (layout + OCR + table)
 try:
-    from .rapid_doc_engine import RapidDocEngine, check_rapiddoc_status
+    from .rapid_doc_engine import RapidDocEngine
     _rapiddoc_engine_instance = RapidDocEngine()
     RAPIDDOC_AVAILABLE = _rapiddoc_engine_instance.is_available()
     if RAPIDDOC_AVAILABLE:
@@ -116,6 +252,7 @@ class PDFProcessor:
         self.pdf_path = pdf_path
         self.document = None
         self.page_count = 0
+        self._hdr_info = None  # Lazy-initialized IdentifyHeaders
         self._load_document()
         
     def _load_document(self) -> None:
@@ -131,6 +268,28 @@ class PDFProcessor:
             }, tags={"component": "pdf_processor"})
             logging.error(f"Failed to load PDF: {e}")
             raise
+
+    def _get_hdr_info(self):
+        """Lazy-initialize document-level heading detector.
+        
+        Uses pymupdf4llm.IdentifyHeaders to scan the entire document and
+        determine heading levels based on font size frequency analysis.
+        The most common font size = body text; larger sizes = headings.
+        
+        Returns:
+            IdentifyHeaders instance, or None if not available.
+        """
+        if self._hdr_info is None and IDENTIFY_HEADERS_AVAILABLE and self.document:
+            try:
+                self._hdr_info = IdentifyHeaders(self.document, max_levels=4)
+                logging.info(
+                    f"IdentifyHeaders initialized: body_limit={self._hdr_info.body_limit}, "
+                    f"header_levels={self._hdr_info.header_id}"
+                )
+            except Exception as e:
+                logging.warning(f"IdentifyHeaders initialization failed: {e}")
+                self._hdr_info = False  # Sentinel: don't retry
+        return self._hdr_info if self._hdr_info else None
     
     def get_page(self, page_num: int) -> pymupdf.Page:
         """Get specific page from document."""
@@ -658,11 +817,27 @@ class PDFProcessor:
                 f"{metadata['num_elements']} elements in {metadata['elapsed']:.1f}s"
             )
             
-            # Detect multi-column layout from block bounding boxes
+            # Detect multi-column layout — prefer column_boxes (robust,
+            # C-native) and fall back to RapidDoc block analysis for
+            # scanned pages where PyMuPDF has no native text layer.
             detected_columns = 1
             col_x_ranges: list = []
-            if metadata.get('block_bboxes'):
+            layout_hints = {'centered': False, 'sparse': False, 'content_y_range': None}
+            if COLUMN_BOXES_AVAILABLE:
+                try:
+                    cb_rects = column_boxes(page, no_image_text=True)
+                    if len(cb_rects) > 1:
+                        detected_columns = len(cb_rects)
+                        col_x_ranges = [(r.x0, r.x1) for r in cb_rects]
+                except Exception:
+                    pass
+            if detected_columns == 1 and metadata.get('block_bboxes'):
                 detected_columns, col_x_ranges = _rapiddoc_engine_instance.detect_column_count(
+                    metadata['block_bboxes'],
+                    metadata.get('page_size'),
+                )
+            if metadata.get('block_bboxes'):
+                layout_hints = _rapiddoc_engine_instance.analyze_layout(
                     metadata['block_bboxes'],
                     metadata.get('page_size'),
                 )
@@ -671,6 +846,10 @@ class PDFProcessor:
                         f"Page {page_num + 1}: Detected {detected_columns}-column layout "
                         f"(x-ranges: {[(f'{x0:.0f}-{x1:.0f}') for x0, x1 in col_x_ranges]})"
                     )
+                if layout_hints.get('centered'):
+                    logging.info(f"Page {page_num + 1}: Layout is centered")
+                if layout_hints.get('sparse'):
+                    logging.info(f"Page {page_num + 1}: Layout is sparse (cover-like)")
             
             # ============================================
             # STEP 3: Parse Markdown into structured elements
@@ -730,6 +909,10 @@ class PDFProcessor:
             # Clear everything — draw white rectangle over entire page
             new_page.draw_rect(page_rect, color=(1, 1, 1), fill=(1, 1, 1))
             
+            # Layout classification
+            is_centered = layout_hints.get('centered', False)
+            is_sparse = layout_hints.get('sparse', False)
+            
             # Adaptive margins — tighter for dense content
             total_chars = sum(len(e.get('text', '')) for e in translated_elements)
             is_dense = total_chars > 2000 or len(translated_elements) > 20
@@ -738,6 +921,11 @@ class PDFProcessor:
                 margin_lr = max(28, page_width * 0.04)
                 margin_top = max(30, page_height * 0.035)
                 margin_bottom = max(30, page_height * 0.035)
+            elif is_sparse:
+                # Sparse/cover pages: generous margins
+                margin_lr = max(50, page_width * 0.08)
+                margin_top = max(40, page_height * 0.045)
+                margin_bottom = max(40, page_height * 0.045)
             else:
                 margin_lr = max(36, page_width * 0.06)
                 margin_top = max(40, page_height * 0.045)
@@ -756,14 +944,78 @@ class PDFProcessor:
                 )
                 text_width = text_rect.width
             
-            # Base font sizing — adaptive based on page size
+            # Base font sizing — adaptive based on page size and layout
             body_font_size = max(8, min(11, text_width / 50))
+            
+            # Boost font size for sparse/cover pages (few elements, lots of whitespace)
+            if is_sparse:
+                body_font_size = max(body_font_size, min(14, text_width / 35))
             
             # CSS color
             css_color = f"rgb({int(text_color[0]*255)}, {int(text_color[1]*255)}, {int(text_color[2]*255)})"
             
+            # ── Adjust text_rect for sparse pages ──
+            # Move text_rect down proportionally if content doesn't start
+            # at the top in the original, and constrain bottom if content
+            # ends well before the page bottom.
+            content_y_range = layout_hints.get('content_y_range')
+            orig_page_size = metadata.get('page_size')
+            
+            # Proportional gap margins for sparse pages (applied inline)
+            # Maps element index → extra margin-top in pt
+            sparse_gap_margins: dict = {}
+            
+            if is_sparse and content_y_range and orig_page_size:
+                orig_h = orig_page_size[1]
+                y_start_pct = content_y_range[0] / orig_h
+                y_end_pct = content_y_range[1] / orig_h
+                
+                # Push text_rect top down proportionally
+                if y_start_pct > 0.10:
+                    new_y0 = page_height * y_start_pct * 0.85
+                    if new_y0 > text_rect.y0 and new_y0 < page_height * 0.5:
+                        text_rect = pymupdf.Rect(
+                            text_rect.x0, new_y0,
+                            text_rect.x1, text_rect.y1
+                        )
+                
+                # Constrain bottom if content doesn't reach page bottom
+                if y_end_pct < 0.85:
+                    new_y1 = page_height * y_end_pct * 1.10
+                    if new_y1 > text_rect.y0 + 100:
+                        text_rect = pymupdf.Rect(
+                            text_rect.x0, text_rect.y0,
+                            text_rect.x1, new_y1
+                        )
+                
+                # Compute proportional vertical gaps from block positions
+                # For sparse pages, elements roughly map 1:1 to content blocks
+                CONTENT_TYPES = {'text', 'title', 'paragraph_title', 'list'}
+                content_bboxes = sorted(
+                    [b['bbox'] for b in metadata.get('block_bboxes', [])
+                     if b.get('type') in CONTENT_TYPES],
+                    key=lambda bb: bb[1]  # sort by y0
+                )
+                
+                n_elems = sum(1 for e in translated_elements
+                              if e.get('text', '').strip())
+                
+                if (len(content_bboxes) >= 2
+                        and abs(n_elems - len(content_bboxes)) <= 2):
+                    # Compute gap ratios between blocks
+                    orig_span = content_y_range[1] - content_y_range[0]
+                    if orig_span > 0:
+                        for i in range(1, len(content_bboxes)):
+                            gap = content_bboxes[i][1] - content_bboxes[i - 1][3]
+                            if gap > 10:  # only for significant gaps
+                                gap_ratio = gap / orig_span
+                                margin_pt = text_rect.height * gap_ratio
+                                sparse_gap_margins[i] = max(10, margin_pt)
+            
             # Build HTML document from all translated elements
             html_parts = []
+            
+            elem_idx = 0
             for elem in translated_elements:
                 elem_type = elem['type']
                 elem_text = elem.get('text', '').strip()
@@ -771,10 +1023,14 @@ class PDFProcessor:
                 if not elem_text:
                     continue
                 
+                # Compute inline margin-top for proportional spacing
+                extra_margin = sparse_gap_margins.get(elem_idx, 0)
+                margin_style = f' style="margin-top: {extra_margin:.0f}pt"' if extra_margin > 5 else ''
+                
                 if elem_type == 'heading':
                     level = min(elem.get('level', 1), 6)
                     html_parts.append(
-                        f'<h{level}>{_escape_html(elem_text)}</h{level}>'
+                        f'<h{level}{margin_style}>{_escape_html(elem_text)}</h{level}>'
                     )
                 elif elem_type == 'table':
                     table_html = self._render_table_as_html(
@@ -783,8 +1039,10 @@ class PDFProcessor:
                     html_parts.append(table_html)
                 else:  # paragraph
                     html_parts.append(
-                        f'<p>{_escape_html(elem_text)}</p>'
+                        f'<p{margin_style}>{_escape_html(elem_text)}</p>'
                     )
+                
+                elem_idx += 1
             
             full_html = '\n'.join(html_parts)
             
@@ -801,11 +1059,20 @@ class PDFProcessor:
                 h_margin_top = f"{body_font_size * 0.5:.1f}pt"
                 h_margin_bottom = f"{body_font_size * 0.2:.1f}pt"
                 line_height = "1.15"
+            elif is_sparse:
+                # Generous spacing for sparse/cover pages
+                p_margin = f"{body_font_size * 0.8:.1f}pt"
+                h_margin_top = f"{body_font_size * 1.5:.1f}pt"
+                h_margin_bottom = f"{body_font_size * 0.6:.1f}pt"
+                line_height = "1.4"
             else:
                 p_margin = f"{body_font_size * 0.4:.1f}pt"
                 h_margin_top = f"{body_font_size * 0.8:.1f}pt"
                 h_margin_bottom = f"{body_font_size * 0.3:.1f}pt"
                 line_height = "1.25"
+            
+            # Text alignment based on layout analysis
+            text_align = "center" if is_centered else "justify"
             
             css = f"""
             * {{
@@ -819,7 +1086,7 @@ class PDFProcessor:
                 line-height: {line_height};
                 margin-top: {p_margin};
                 margin-bottom: {p_margin};
-                text-align: justify;
+                text-align: {text_align};
             }}
             h1 {{
                 font-size: {h1_size:.1f}pt;
@@ -827,6 +1094,7 @@ class PDFProcessor:
                 line-height: 1.15;
                 margin-top: {h_margin_top};
                 margin-bottom: {h_margin_bottom};
+                text-align: {text_align};
             }}
             h2 {{
                 font-size: {h2_size:.1f}pt;
@@ -834,6 +1102,7 @@ class PDFProcessor:
                 line-height: 1.15;
                 margin-top: {h_margin_top};
                 margin-bottom: {h_margin_bottom};
+                text-align: {text_align};
             }}
             h3 {{
                 font-size: {h3_size:.1f}pt;
@@ -841,6 +1110,7 @@ class PDFProcessor:
                 line-height: 1.2;
                 margin-top: {h_margin_top};
                 margin-bottom: {h_margin_bottom};
+                text-align: {text_align};
             }}
             h4, h5, h6 {{
                 font-size: {h4_size:.1f}pt;
@@ -848,6 +1118,7 @@ class PDFProcessor:
                 line-height: 1.2;
                 margin-top: {h_margin_top};
                 margin-bottom: {h_margin_bottom};
+                text-align: {text_align};
             }}
             table {{
                 border-collapse: collapse;
@@ -1335,7 +1606,20 @@ class PDFProcessor:
                     text_color, ocr_language
                 )
         
-        text_dict = page.get_text("dict")
+        text_dict = page.get_text("dict", sort=True)
+        
+        # ============================================
+        # PHASE 0b: Detect page-level alignment, margins and header/footer zones
+        # ============================================
+        page_alignment = _detect_page_alignment(text_dict, page.rect.width)
+        
+        # Detect header/footer zones (top/bottom 8% of page)
+        page_height = page.rect.height
+        header_zone_y = page_height * 0.08
+        footer_zone_y = page_height * 0.92
+        
+        logging.info(f"Page {page_num + 1}: Detected alignment={page_alignment['alignment']}, "
+                      f"margins=({page_alignment['left_margin']:.0f}, {page_alignment['right_margin']:.0f})")
         
         # Collect ALL areas to redact (will be applied in bulk before insertions)
         areas_to_redact = []
@@ -1348,11 +1632,152 @@ class PDFProcessor:
         logging.info(f"Page {page_num + 1}: Found {total_blocks} text blocks to process (preserve_line_breaks={preserve_line_breaks})")
         
         # ============================================
+        # PHASE 0c: Detect and translate tables
+        # ============================================
+        table_rects = []  # List of pymupdf.Rect for table areas to skip in block processing
+        try:
+            tables = page.find_tables()
+            if tables.tables:
+                logging.info(f"Page {page_num + 1}: Found {len(tables.tables)} tables")
+                for tab_idx, tab in enumerate(tables.tables):
+                    tab_rect = pymupdf.Rect(tab.bbox)
+                    table_rects.append(tab_rect)
+                    
+                    # Extract table data
+                    cells_data = tab.extract()
+                    if not cells_data:
+                        continue
+                    
+                    # Translate each cell
+                    translated_cells = []
+                    for row in cells_data:
+                        translated_row = []
+                        for cell in row:
+                            if cell and cell.strip():
+                                try:
+                                    cell_trans = translator.translate(cell.strip())
+                                    translated_row.append(cell_trans if cell_trans else cell)
+                                except Exception:
+                                    translated_row.append(cell)
+                            else:
+                                translated_row.append(cell or "")
+                        translated_cells.append(translated_row)
+                    
+                    # Redact the table area
+                    areas_to_redact.append(tuple(tab_rect))
+                    
+                    # We'll insert the translated table as text after redaction
+                    # Calculate cell positions from the table structure
+                    num_rows = tab.row_count
+                    num_cols = tab.col_count
+                    
+                    if num_rows > 0 and num_cols > 0:
+                        cell_height = (tab_rect.height) / num_rows
+                        cell_width = (tab_rect.width) / num_cols
+                        
+                        for r_idx, row in enumerate(translated_cells):
+                            for c_idx, cell_text in enumerate(row):
+                                if not cell_text or not cell_text.strip():
+                                    continue
+                                
+                                # Calculate cell bbox
+                                cell_x0 = tab_rect.x0 + c_idx * cell_width + 2  # 2pt padding
+                                cell_y0 = tab_rect.y0 + r_idx * cell_height + 2
+                                cell_x1 = tab_rect.x0 + (c_idx + 1) * cell_width - 2
+                                cell_y1 = tab_rect.y0 + (r_idx + 1) * cell_height - 2
+                                
+                                cell_bbox = (cell_x0, cell_y0, cell_x1, cell_y1)
+                                
+                                # Estimate font size from cell height
+                                cell_font_size = min(10, max(6, cell_height * 0.5))
+                                
+                                # Create a synthetic LineFormatInfo for cell
+                                cell_line_info = LineFormatInfo(
+                                    text=cell_text,
+                                    spans=[],
+                                    merged_bbox=cell_bbox,
+                                    text_align='left',
+                                )
+                                
+                                translations_to_insert.append({
+                                    'line_info': cell_line_info,
+                                    'line_data': {
+                                        'text': cell_text,
+                                        'bboxes': [cell_bbox],
+                                        'merged_bbox': cell_bbox,
+                                        'avg_size': cell_font_size,
+                                        'is_bold': False,
+                                        'is_italic': False,
+                                        'is_serif': False,
+                                        'is_monospace': False,
+                                        'dominant_color': (0, 0, 0),
+                                        'rotation': 0,
+                                        'text_align': 'left',
+                                        'indent': 0,
+                                    },
+                                    'text': cell_text,
+                                    'formatted_html': cell_text,
+                                    'use_html': False,
+                                    'is_table_cell': True,
+                                })
+                                translated_count += 1
+                    
+                    logging.info(f"  Table {tab_idx}: {num_rows}x{num_cols} translated")
+        except Exception as e:
+            logging.warning(f"Table detection/translation failed: {e}")
+            table_rects = []
+        
+        # ============================================
         # PHASE 0: Pre-merge single-line blocks into paragraph groups
         # ============================================
-        # Many PDFs have each line as a separate block, which defeats paragraph-level
-        # translation. We first merge adjacent blocks that belong to the same paragraph.
-        merged_block_groups = self._merge_single_line_blocks(text_dict)
+        # Strategy: use pymupdf4llm's column_boxes() for robust multi-column
+        # detection and reading-order sorting. This is a battle-tested algorithm
+        # maintained by the PyMuPDF team that handles:
+        # - Multi-column layouts (academic papers, newspapers, etc.)
+        # - Background color zones (sidebars, callout boxes)
+        # - Header/footer exclusion
+        # - Table/image area avoidance
+        # - Correct reading order across columns
+        # Falls back to heuristic merging if pymupdf4llm is not installed.
+        
+        if COLUMN_BOXES_AVAILABLE:
+            # Build avoid list from detected table rects
+            avoid_rects = [pymupdf.Rect(tr) for tr in table_rects] if table_rects else None
+            
+            try:
+                text_rects = column_boxes(
+                    page,
+                    footer_margin=page_height * 0.08,   # 8% footer zone
+                    header_margin=page_height * 0.08,    # 8% header zone
+                    no_image_text=True,
+                    avoid=avoid_rects,
+                )
+                
+                # For each column rect, extract text blocks and build paragraph groups
+                merged_block_groups = []
+                for rect in text_rects:
+                    clip_dict = page.get_text("dict", clip=rect, sort=True)
+                    groups = self._merge_text_blocks(clip_dict, page_height)
+                    merged_block_groups.extend(groups)
+                
+                logging.info(
+                    f"Page {page_num + 1}: column_boxes found {len(text_rects)} regions "
+                    f"→ {len(merged_block_groups)} paragraph groups"
+                )
+            except Exception as e:
+                logging.warning(f"column_boxes failed: {e}, falling back to heuristic merging")
+                merged_block_groups = self._merge_text_blocks(
+                    text_dict, page_height,
+                    header_zone_y=header_zone_y, footer_zone_y=footer_zone_y,
+                    check_x_overlap=True,
+                )
+        else:
+            # ── FALLBACK: PyMuPDF-only heuristic paragraph merging ──
+            merged_block_groups = self._merge_text_blocks(
+                text_dict, page_height,
+                header_zone_y=header_zone_y, footer_zone_y=footer_zone_y,
+                check_x_overlap=True,
+            )
         
         # ============================================
         # PHASE 1: Extract structure with SPAN-LEVEL formatting
@@ -1363,6 +1788,26 @@ class PDFProcessor:
             
             for block_data in block_group:
                 block = block_data['block']
+                
+                # Skip blocks that overlap with detected tables
+                # (tables are handled separately in Phase 0c)
+                if table_rects:
+                    block_bbox = block.get("bbox", (0, 0, 0, 0))
+                    block_rect = pymupdf.Rect(block_bbox)
+                    skip_block = False
+                    for tab_rect in table_rects:
+                        # Check if block significantly overlaps with table
+                        intersection = block_rect & tab_rect
+                        if intersection.is_empty:
+                            continue
+                        overlap_area = intersection.width * intersection.height
+                        block_area = block_rect.width * block_rect.height
+                        if block_area > 0 and overlap_area / block_area > 0.5:
+                            skip_block = True
+                            break
+                    if skip_block:
+                        logging.debug(f"Skipping block overlapping table: {block_bbox}")
+                        continue
                 
                 for line in block.get("lines", []):
                     if "spans" not in line:
@@ -1446,15 +1891,48 @@ class PDFProcessor:
                         span_formats.append(span_format)
                     
                     if span_formats:
-                        line_text = " ".join(s.text for s in span_formats)
+                        # Smart span joining: only add space if there's a gap between spans
+                        # Many PDFs split words across spans (for formatting changes mid-word)
+                        # Blindly adding " " creates artifacts like "in troduction"
+                        parts = []
+                        for idx_s, sf in enumerate(span_formats):
+                            if idx_s == 0:
+                                parts.append(sf.text)
+                            else:
+                                prev_sf = span_formats[idx_s - 1]
+                                # Check horizontal gap between end of previous span and start of current
+                                prev_right = prev_sf.bbox[2]  # x1
+                                curr_left = sf.bbox[0]         # x0
+                                gap = curr_left - prev_right
+                                avg_char_w = prev_sf.size * 0.3  # ~30% of font size = typical char width
+                                
+                                # If spans overlap or are very close, no space needed
+                                if gap < avg_char_w:
+                                    # Check if previous text ends or current starts with space
+                                    if prev_sf.text.endswith(' ') or sf.text.startswith(' '):
+                                        parts.append(sf.text)
+                                    else:
+                                        parts.append(sf.text)
+                                else:
+                                    # Gap detected: add space separator
+                                    parts.append(" " + sf.text)
+                        
+                        line_text = "".join(parts)
                         merged_bbox = self._merge_bboxes(line_bboxes)
+                        
+                        # Calculate indentation relative to page left margin
+                        line_x0 = merged_bbox[0]
+                        page_left_margin = page_alignment['left_margin']
+                        indent = max(0.0, line_x0 - page_left_margin)
                         
                         line_info = LineFormatInfo(
                             text=line_text,
                             spans=span_formats,
                             merged_bbox=merged_bbox,
                             rotation=rotation,
-                            wmode=line_wmode
+                            wmode=line_wmode,
+                            text_align=page_alignment['alignment'],
+                            indent=indent,
                         )
                         lines_info.append(line_info)
                         
@@ -1492,9 +1970,17 @@ class PDFProcessor:
                     if len(para_lines) == 1:
                         line_info = para_lines[0]
                         try:
-                            line_trans = translator.translate(line_info.text)
-                            if not line_trans or not line_trans.strip():
-                                line_trans = line_info.text
+                            # Check for list item: preserve prefix, translate body only
+                            prefix, body = _extract_list_prefix(line_info.text)
+                            if prefix:
+                                body_trans = translator.translate(body.strip())
+                                if not body_trans or not body_trans.strip():
+                                    body_trans = body
+                                line_trans = prefix + body_trans
+                            else:
+                                line_trans = translator.translate(line_info.text)
+                                if not line_trans or not line_trans.strip():
+                                    line_trans = line_info.text
                             
                             formatted_text = self._apply_span_formatting(
                                 line_info, line_trans, use_original_color
@@ -1521,7 +2007,16 @@ class PDFProcessor:
                     else:
                         # Multi-line paragraph - translate together and insert in UNIFIED bbox
                         # This prevents overlapping text by using one merged bbox for the whole paragraph
-                        para_text = " ".join(li.text for li in para_lines)
+                        
+                        # Check if first line has a list prefix — preserve it
+                        first_text = para_lines[0].text.strip()
+                        list_prefix, first_body = _extract_list_prefix(first_text)
+                        
+                        if list_prefix:
+                            # Join body of first line + rest of lines for translation
+                            para_text = first_body.strip() + " " + " ".join(li.text for li in para_lines[1:])
+                        else:
+                            para_text = " ".join(li.text for li in para_lines)
                         
                         try:
                             translated_para = translator.translate(para_text)
@@ -1542,6 +2037,10 @@ class PDFProcessor:
                                     })
                                     translated_count += 1
                                 continue
+                            
+                            # Re-prepend list prefix if present
+                            if list_prefix:
+                                translated_para = list_prefix + translated_para
                             
                             # NEW APPROACH: Insert ALL translated text in ONE unified bbox
                             # This prevents overlap caused by text wrapping into adjacent line bboxes
@@ -1701,6 +2200,16 @@ class PDFProcessor:
         # ============================================
         logging.info(f"Applying {len(areas_to_redact)} redactions to remove original text...")
         
+        # Save links before redaction (redaction destroys annotations including links)
+        saved_links = []
+        try:
+            for link in page.get_links():
+                saved_links.append(link.copy())
+            if saved_links:
+                logging.info(f"Saved {len(saved_links)} links before redaction")
+        except Exception as e:
+            logging.warning(f"Failed to save links: {e}")
+        
         for bbox in areas_to_redact:
             try:
                 # Add redaction annotation with white fill
@@ -1710,8 +2219,24 @@ class PDFProcessor:
                 logging.warning(f"Failed to add redaction for {bbox}: {e}")
         
         # Apply all redactions at once (this actually removes the text)
-        page.apply_redactions()
-        logging.info(f"Redactions applied successfully")
+        # IMPORTANT: Preserve images and vector graphics during redaction
+        # Without these flags, apply_redactions() destroys ALL overlapping content
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,   # Don't touch images
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE  # Don't touch vector graphics/lines
+        )
+        logging.info(f"Redactions applied successfully (images & graphics preserved)")
+        
+        # Restore links after redaction
+        if saved_links:
+            restored = 0
+            for link in saved_links:
+                try:
+                    page.insert_link(link)
+                    restored += 1
+                except Exception as e:
+                    logging.debug(f"Failed to restore link: {e}")
+            logging.info(f"Restored {restored}/{len(saved_links)} links after redaction")
         
         # ============================================
         # PHASE 3: Insert translations with SPAN-LEVEL formatting
@@ -1846,47 +2371,33 @@ class PDFProcessor:
         if preserve_font_style:
             if line_info.is_monospace:
                 font_family = '"Courier New", Courier, monospace'
-                char_width_factor = 0.6
+                pdf_font_name = "cour"
             elif line_info.is_serif:
                 font_family = 'Georgia, "Times New Roman", Times, serif'
-                char_width_factor = 0.5
+                pdf_font_name = "tiro"
             else:
                 font_family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif'
-                char_width_factor = 0.52
+                pdf_font_name = "helv"
         else:
             font_family = 'Helvetica, Arial, sans-serif'
-            char_width_factor = 0.52
+            pdf_font_name = "helv"
         
         # Strip HTML tags for width calculation
         plain_text = re.sub(r'<[^>]+>', '', formatted_html)
         plain_text = plain_text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
         
-        # Character width estimation
-        avg_char_width = target_font_size * char_width_factor
-        estimated_width = len(plain_text) * avg_char_width
+        # Accurate text width measurement using PyMuPDF Font metrics
+        try:
+            measure_font = pymupdf.Font(pdf_font_name)
+            estimated_width = measure_font.text_length(plain_text, fontsize=target_font_size)
+        except Exception:
+            # Fallback to rough estimation if Font creation fails
+            estimated_width = len(plain_text) * target_font_size * 0.52
         
-        # Determine if we need text wrapping
-        needs_wrapping = estimated_width > bbox_width * 1.5
-        
-        # IMPORTANT: Keep original font size - do NOT scale
-        # The original size is preserved to maintain document appearance
-        # If text doesn't fit, we use wrapping instead of shrinking
-        if estimated_width > bbox_width and not needs_wrapping:
-            # Allow wrapping for long text rather than shrinking
-            needs_wrapping = True
-        
-        # Expand bbox height if text needs wrapping (Italian ~15-20% longer than English)
-        if needs_wrapping:
-            estimated_lines = max(1, estimated_width / bbox_width)
-            line_height = target_font_size * 1.2  # slightly more than CSS line-height for safety
-            required_height = estimated_lines * line_height
-            if required_height > bbox_height:
-                # Expand bbox downward to fit wrapped text
-                # Use 30% buffer and allow up to 3x height for very long translations
-                expanded_height = min(required_height * 1.3, bbox_height * 3.0)
-                merged_bbox = (merged_bbox[0], merged_bbox[1], merged_bbox[2], merged_bbox[1] + expanded_height)
-                bbox_height = expanded_height
-                logging.debug(f"Expanded bbox height: {required_height:.1f} -> {expanded_height:.1f}pt")
+        # Determine if text needs wrapping (translated text wider than box)
+        needs_wrapping = estimated_width > bbox_width
+        # No bbox expansion — insert_htmlbox's scale_low handles fitting
+        # via binary search in native C code, more accurate than manual estimates
         
         # Get rotation from line_info
         rotation = line_info.rotation
@@ -1905,6 +2416,9 @@ class PDFProcessor:
             white_space = "nowrap"
             word_wrap = "normal"
         
+        # Apply text alignment from page-level detection
+        text_align = getattr(line_info, 'text_align', 'left')
+        
         css = f"""* {{
             font-family: {font_family};
             font-size: {target_font_size}pt;
@@ -1916,6 +2430,7 @@ class PDFProcessor:
             margin: 0;
             white-space: {white_space};
             word-wrap: {word_wrap};
+            text-align: {text_align};
             font-variant-ligatures: none;
             -webkit-font-variant-ligatures: none;
             font-feature-settings: "liga" 0, "clig" 0;
@@ -1933,11 +2448,11 @@ class PDFProcessor:
             is_footnote = target_font_size < 11 or merged_bbox[1] > page_height * 0.7
             
             if is_footnote:
-                # Footnotes: allow up to 50% shrinking for dense text
-                scale_low = 0.5
+                # Footnotes: allow up to 60% shrinking for dense text
+                scale_low = 0.4
             else:
-                # Normal text: allow up to 40% shrinking
-                scale_low = 0.6
+                # Normal text: allow up to 50% shrinking
+                scale_low = 0.5
             
             result = page.insert_htmlbox(merged_bbox, formatted_html, css=css, rotate=rotation, scale_low=scale_low)
             if result[0] < 0:
@@ -1953,6 +2468,21 @@ class PDFProcessor:
                 capture_exception(e2, context={"operation": "insert_plain_fallback"}, tags={"component": "pdf_processor"})
                 logging.error(f"Plain text fallback also failed: {e2}")
     
+    def _is_heading_by_font_size(self, avg_size: float) -> str:
+        """Check if a font size corresponds to a heading using IdentifyHeaders.
+        
+        Returns:
+            Heading prefix (e.g. '# ', '## ') or '' for body text.
+        """
+        hdr_info = self._get_hdr_info()
+        if hdr_info is None:
+            return ""
+        # IdentifyHeaders works with rounded font sizes
+        rounded = round(avg_size)
+        if rounded <= hdr_info.body_limit:
+            return ""
+        return hdr_info.header_id.get(rounded, "")
+
     def _group_lines_into_paragraphs(
         self, 
         lines_info: List[LineFormatInfo]
@@ -1962,14 +2492,19 @@ class PDFProcessor:
         
         This intelligently detects paragraph boundaries to ensure:
         - Titles/headings are translated separately
+        - Multi-line headings of the SAME level stay grouped together
         - Paragraph text flows naturally within the group
         - Structure is preserved when line breaks are meaningful
         
+        Uses pymupdf4llm.IdentifyHeaders for document-level heading detection
+        (font-size frequency analysis across all pages), falling back to
+        heuristics if unavailable.
+        
         Paragraph break indicators:
-        1. Previous line ends with sentence punctuation (. ! ? :)
-        2. Current line has significantly different font size (±20%)
+        1. Previous line ends with sentence punctuation (. ! ? :) + gap
+        2. Transition between heading and body text (or different heading levels)
         3. Current line is bold when previous wasn't (or vice versa)
-        4. Current line is very short (< 40 chars) and looks like a title
+        4. Current line starts with a bullet or list marker
         5. There's significant vertical gap between lines
         
         Args:
@@ -2021,32 +2556,40 @@ class PDFProcessor:
                 should_break = True
                 break_reason = "sentence_end_with_gap"
             
-            # Check 2: Significant font size change (likely heading)
+            # Check 2: Heading-level transition (document-level font-size analysis)
+            # Uses IdentifyHeaders: if both lines are the SAME heading level,
+            # they are part of the same multi-line heading — do NOT break.
+            # Break only on transitions: heading→body, body→heading, or h1→h2.
             if not should_break:
-                size_ratio = curr_line.avg_size / prev_line.avg_size if prev_line.avg_size > 0 else 1
-                if size_ratio > 1.2 or size_ratio < 0.8:
+                prev_hdr = self._is_heading_by_font_size(prev_line.avg_size)
+                curr_hdr = self._is_heading_by_font_size(curr_line.avg_size)
+                
+                if prev_hdr != curr_hdr:
+                    # Transition between different levels or heading↔body
                     should_break = True
-                    break_reason = f"size_change ({size_ratio:.2f})"
+                    prev_label = prev_hdr.strip() if prev_hdr else "body"
+                    curr_label = curr_hdr.strip() if curr_hdr else "body"
+                    break_reason = f"heading_transition ({prev_label}→{curr_label})"
+                elif not prev_hdr and not curr_hdr:
+                    # Both are body text — fall through to other checks
+                    pass
+                # else: both are same heading level — do NOT break (multi-line heading)
             
-            # Check 3: Bold status change (heading detection)
+            # Check 3: Bold status change (only for body text, not headings)
             if not should_break:
-                if curr_line.is_bold != prev_line.is_bold:
-                    # Current line is bold (start of heading) or previous was bold (end of heading)
-                    should_break = True
-                    break_reason = "bold_change"
-            
-            # Check 4: Short line that looks like a title
-            if not should_break:
-                curr_text = curr_line.text.strip()
-                # Short, possibly title-case, no ending punctuation
-                if (len(curr_text) < 50 and 
-                    len(curr_text.split()) <= 6 and
-                    curr_text and 
-                    curr_text[-1] not in '.,;'):
-                    # Additional check: is it title case or all caps?
-                    if curr_text.istitle() or curr_text.isupper():
+                curr_hdr = self._is_heading_by_font_size(curr_line.avg_size)
+                if not curr_hdr:  # Only apply to body text
+                    if curr_line.is_bold != prev_line.is_bold:
                         should_break = True
-                        break_reason = "title_pattern"
+                        break_reason = "bold_change"
+            
+            # Check 4: Current line starts with a bullet or list marker
+            # Each list item should be a separate paragraph to preserve structure
+            if not should_break:
+                curr_stripped = curr_line.text.strip()
+                if _is_list_item(curr_stripped):
+                    should_break = True
+                    break_reason = "list_item"
             
             # Check 5: Large vertical gap between lines (already calculated)
             if not should_break and has_large_gap:
@@ -2066,47 +2609,42 @@ class PDFProcessor:
         
         return paragraphs
     
-    def _merge_single_line_blocks(
+    def _merge_text_blocks(
         self,
-        text_dict: Dict[str, Any]
+        text_dict: Dict[str, Any],
+        page_height: float = 800.0,
+        header_zone_y: Optional[float] = None,
+        footer_zone_y: Optional[float] = None,
+        check_x_overlap: bool = False,
     ) -> List[List[Dict[str, Any]]]:
         """
         Merge adjacent single-line blocks into logical paragraph groups.
         
-        Many PDFs (especially those from LaTeX) have each line as a separate block.
-        This defeats paragraph-level translation. This function pre-merges blocks
-        that should be translated together.
+        Unified function for both the column_boxes path (where column detection
+        and zone filtering are already handled) and the heuristic fallback path.
         
-        Merge conditions (consecutive blocks are merged if ALL are true):
-        1. Previous block does NOT end with sentence punctuation (.!?)
-        2. Font size is similar (within 15%)
-        3. Font style (bold) is the same
-        4. Not a short title-like line
-        
-        Break conditions (start new paragraph):
-        1. Previous line ends with .!?
-        2. Significant font size change (heading)
-        3. Bold status changes
-        4. Current line looks like a title (short, title case, no ending punct)
+        When called from column_boxes regions, omit zone params and set
+        check_x_overlap=False.  When called as the fallback, enable all checks.
         
         Args:
-            text_dict: The page text dictionary from get_text("dict")
+            text_dict: Page text dictionary from get_text("dict")
+            page_height: Full page height (for footnote detection)
+            header_zone_y: If set, y below which is the header zone
+            footer_zone_y: If set, y above which is the footer zone
+            check_x_overlap: Require 30% X-overlap between blocks (column guard)
             
         Returns:
-            List of block groups, where each group is a list of blocks
-            that should be translated together as one paragraph
+            List of block groups for paragraph-level translation
         """
-        # First collect all text blocks with their lines
+        # Collect all text blocks with their metadata
         text_blocks = []
         for block in text_dict.get("blocks", []):
             if "lines" not in block:
                 continue
-            
             lines = block.get("lines", [])
             if not lines:
                 continue
             
-            # Get combined text from all spans in all lines
             block_text = ""
             for line in lines:
                 for span in line.get("spans", []):
@@ -2115,57 +2653,49 @@ class PDFProcessor:
             if not block_text.strip():
                 continue
             
-            # Get formatting info from first span of first line
             first_span = lines[0].get("spans", [{}])[0] if lines[0].get("spans") else {}
-            
             text_blocks.append({
                 'block': block,
                 'text': block_text.strip(),
                 'font_size': first_span.get("size", 11),
                 'font': first_span.get("font", ""),
                 'is_bold': 'Bold' in first_span.get("font", "") or bool(first_span.get("flags", 0) & 16),
-                'bbox': block.get("bbox", [0, 0, 0, 0])
+                'bbox': block.get("bbox", [0, 0, 0, 0]),
             })
         
         if not text_blocks:
             return []
         
-        # Now merge consecutive blocks based on paragraph logic
+        check_zones = header_zone_y is not None and footer_zone_y is not None
+        
         merged_groups: List[List[Dict[str, Any]]] = []
         current_group: List[Dict[str, Any]] = [text_blocks[0]]
         
         for i in range(1, len(text_blocks)):
             prev = text_blocks[i - 1]
             curr = text_blocks[i]
-            
             should_merge = True
             
             # Check 1: Previous block ends with sentence punctuation
             prev_text = prev['text'].rstrip()
             if prev_text and prev_text[-1] in '.!?':
-                # Check it's not an abbreviation (e.g., "Dr." "Fig." "etc.")
                 words = prev_text.split()
                 if words:
                     last_word = words[-1].rstrip('.!?')
-                    # Not an abbreviation if word is longer than 3 chars
-                    # or if it's all caps (likely acronym sentence end)
                     if len(last_word) > 3 or (last_word.isupper() and len(last_word) > 1):
                         should_merge = False
             
             # Check 1b: Previous block is short metadata (date, version, etc.)
-            # These standalone lines should NOT merge with body text
             if should_merge:
                 prev_lower = prev_text.lower()
-                # Pattern: short line with date/version indicators
                 metadata_patterns = [
                     'draft:', 'first draft', 'version:', 'date:', 'revised:',
                     'bozza:', 'prima bozza', 'versione:', 'data:', 'revisionato:'
                 ]
                 is_metadata = any(pat in prev_lower for pat in metadata_patterns)
-                # Also catch lines ending with a year (e.g., "April 11, 2015")
                 if not is_metadata and len(prev_text) < 60:
-                    import re
-                    if re.search(r'\b(19|20)\d{2}\b\s*$', prev_text):
+                    import re as _re
+                    if _re.search(r'\b(19|20)\d{2}\b\s*$', prev_text):
                         is_metadata = True
                 if is_metadata and len(prev_text) < 60:
                     should_merge = False
@@ -2184,55 +2714,59 @@ class PDFProcessor:
             # Check 4: Short title-like line
             if should_merge:
                 curr_text = curr['text']
-                # Short, title-case or all caps, no ending punctuation
                 if len(curr_text) < 50 and len(curr_text.split()) <= 8:
                     if curr_text[-1] not in '.,;:':
                         if curr_text.istitle() or curr_text.isupper():
                             should_merge = False
             
-            # Check 4b: Footnote pattern - current text starts with number
-            # (e.g., "3 Rakoff 1983" or "2 Throughout...")
+            # Check 4b: Footnote pattern
             if should_merge:
-                import re
                 curr_text = curr['text'].strip()
-                if re.match(r'^\d+\s', curr_text):
-                    # Looks like a footnote, don't merge
+                curr_y = curr['bbox'][1]
+                if _is_likely_footnote_marker(curr_text, curr['font_size'], page_height, curr_y):
+                    should_merge = False
+            
+            # Check 4c: List item
+            if should_merge:
+                if _is_list_item(curr['text'].strip()):
+                    should_merge = False
+            
+            # Check 4d: Header/footer zone boundary (only when not pre-clipped)
+            if should_merge and check_zones:
+                prev_in_header = prev['bbox'][3] < header_zone_y
+                curr_in_header = curr['bbox'][1] < header_zone_y
+                prev_in_footer = prev['bbox'][1] > footer_zone_y
+                curr_in_footer = curr['bbox'][1] > footer_zone_y
+                if prev_in_header != curr_in_header:
+                    should_merge = False
+                elif prev_in_footer != curr_in_footer:
                     should_merge = False
             
             # Check 5: Significant vertical gap between blocks
             if should_merge:
-                prev_bottom = prev['bbox'][3]  # y1
-                curr_top = curr['bbox'][1]      # y0
+                prev_bottom = prev['bbox'][3]
+                curr_top = curr['bbox'][1]
                 gap = curr_top - prev_bottom
                 avg_font_size = (prev['font_size'] + curr['font_size']) / 2
-                
-                # Gap larger than 2x font size suggests paragraph break
                 if gap > avg_font_size * 2:
                     should_merge = False
             
-            # Check 6: COLUMN DETECTION - blocks must have X overlap to merge
-            # This prevents merging blocks from different columns
-            if should_merge:
+            # Check 6: Column detection via X-overlap (only in fallback path)
+            if should_merge and check_x_overlap:
                 prev_x0, prev_x1 = prev['bbox'][0], prev['bbox'][2]
                 curr_x0, curr_x1 = curr['bbox'][0], curr['bbox'][2]
-                
-                # Calculate horizontal overlap
                 overlap_start = max(prev_x0, curr_x0)
                 overlap_end = min(prev_x1, curr_x1)
                 overlap = max(0, overlap_end - overlap_start)
-                
-                # Calculate widths
-                prev_width = prev_x1 - prev_x0
-                curr_width = curr_x1 - curr_x0
-                min_width = min(prev_width, curr_width) if min(prev_width, curr_width) > 0 else 1
-                
-                # Require at least 30% overlap of the narrower block
-                # This allows for slight indentation but catches different columns
+                min_width = min(prev_x1 - prev_x0, curr_x1 - curr_x0)
+                min_width = max(min_width, 1)
                 overlap_ratio = overlap / min_width
-                
                 if overlap_ratio < 0.30:
                     should_merge = False
-                    logging.debug(f"Column break detected: overlap {overlap_ratio:.1%} between '{prev['text'][:20]}...' and '{curr['text'][:20]}...'")
+                    logging.debug(
+                        f"Column break: overlap {overlap_ratio:.1%} between "
+                        f"'{prev['text'][:20]}…' and '{curr['text'][:20]}…'"
+                    )
             
             if should_merge:
                 current_group.append(curr)
@@ -2240,12 +2774,10 @@ class PDFProcessor:
                 merged_groups.append(current_group)
                 current_group = [curr]
         
-        # Don't forget the last group
         if current_group:
             merged_groups.append(current_group)
         
-        logging.info(f"Cross-block merge: {len(text_blocks)} blocks -> {len(merged_groups)} paragraph groups")
-        
+        logging.info(f"Block merge: {len(text_blocks)} blocks -> {len(merged_groups)} paragraph groups")
         return merged_groups
     
     def _merge_bboxes(self, bboxes: List[Tuple]) -> Tuple[float, float, float, float]:
@@ -2286,8 +2818,8 @@ class PDFProcessor:
         """
         WHITE = pymupdf.pdfcolor["white"]
         
-        # Normalize text for PDF rendering (handle ligatures, special chars)
-        translated_text = _normalize_text_for_pdf(translated_text)
+        # Normalize text for PDF rendering (preserve typographic chars for native text)
+        translated_text = _normalize_text_for_pdf(translated_text, is_ocr=False)
         
         # Clear all original spans (unless already cleared via redaction)
         if not skip_clearing:
@@ -2319,33 +2851,27 @@ class PDFProcessor:
             if line_data.get('is_monospace', False):
                 font_family = '"Courier New", Courier, monospace'
                 pdf_font = "cour"  # Courier
-                char_width_factor = 0.6  # Monospace is wider
             elif line_data.get('is_serif', False):
                 font_family = 'Georgia, "Times New Roman", Times, serif'
                 pdf_font = "tiro"  # Times Roman
-                char_width_factor = 0.5
             else:
                 font_family = '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif'
                 pdf_font = "helv"  # Helvetica
-                char_width_factor = 0.52
         else:
             font_family = 'Helvetica, Arial, sans-serif'
             pdf_font = "helv"
-            char_width_factor = 0.52
         
-        # Character width estimation
-        avg_char_width = target_font_size * char_width_factor
-        estimated_width = len(translated_text) * avg_char_width
+        # Accurate text width measurement using PyMuPDF Font metrics
+        try:
+            measure_font = pymupdf.Font(pdf_font)
+            estimated_width = measure_font.text_length(translated_text, fontsize=target_font_size)
+        except Exception:
+            # Fallback to rough estimation if Font creation fails
+            estimated_width = len(translated_text) * target_font_size * 0.52
         
-        # Determine if we need text wrapping
-        needs_wrapping = estimated_width > bbox_width * 1.5
-        
-        # IMPORTANT: Keep original font size - do NOT scale
-        # The original size is preserved to maintain document appearance
-        # If text doesn't fit, we use wrapping instead of shrinking
-        if estimated_width > bbox_width and not needs_wrapping:
-            # Allow wrapping for long text rather than shrinking
-            needs_wrapping = True
+        # Determine if text needs wrapping (translated text wider than box)
+        needs_wrapping = estimated_width > bbox_width
+        # No bbox expansion — insert_htmlbox's scale_low handles fitting
         
         # Get rotation from line_data (0, 90, 180, 270)
         rotation = line_data.get('rotation', 0)
@@ -2423,12 +2949,13 @@ class PDFProcessor:
                 word-wrap: {word_wrap};
                 overflow: {overflow};
                 text-overflow: {text_overflow};
+                text-align: {line_data.get('text_align', 'left')};
                 font-variant-ligatures: none;
                 -webkit-font-variant-ligatures: none;
                 font-feature-settings: "liga" 0, "clig" 0;
             }}"""
             
-            page.insert_htmlbox(merged_bbox, translated_text, css=css, rotate=rotation)
+            page.insert_htmlbox(merged_bbox, translated_text, css=css, rotate=rotation, scale_low=0.5)
             if rotation != 0:
                 logging.debug(f"[OK] HTML insertion successful (wrap={needs_wrapping}, rotation={rotation}°)")
             else:
@@ -2451,8 +2978,28 @@ class PDFProcessor:
                 else:
                     insert_point = (merged_bbox[0], merged_bbox[1] + target_font_size)
                 
-                max_chars = int(bbox_width / (target_font_size * 0.45))
-                display_text = translated_text[:max_chars-3] + "..." if len(translated_text) > max_chars else translated_text
+                # Accurate truncation using font metrics
+                try:
+                    _trunc_font = pymupdf.Font(pdf_font)
+                    # Find how many chars fit by measuring progressively
+                    _trunc_width = _trunc_font.text_length(translated_text, fontsize=target_font_size)
+                    if _trunc_width > bbox_width:
+                        # Use char_lengths for precise per-character measurement
+                        _char_widths = _trunc_font.char_lengths(translated_text, fontsize=target_font_size)
+                        _ellipsis_w = _trunc_font.text_length("...", fontsize=target_font_size)
+                        _accum = 0.0
+                        max_chars = 0
+                        for _cw in _char_widths:
+                            if _accum + _cw + _ellipsis_w > bbox_width:
+                                break
+                            _accum += _cw
+                            max_chars += 1
+                        display_text = translated_text[:max_chars] + "..." if max_chars < len(translated_text) else translated_text
+                    else:
+                        display_text = translated_text
+                except Exception:
+                    max_chars = int(bbox_width / (target_font_size * 0.45))
+                    display_text = translated_text[:max_chars-3] + "..." if len(translated_text) > max_chars else translated_text
                 
                 page.insert_text(
                     insert_point,

@@ -23,7 +23,6 @@ Usage:
         markdown = engine.extract_page_markdown(pdf_bytes, page_num=0)
 """
 import os
-import io
 import logging
 import time
 from typing import Optional, Tuple, List, Dict, Any
@@ -468,7 +467,10 @@ class RapidDocEngine:
                 1 for x0, x1 in intervals
                 if cx0 - BIN <= (x0 + x1) / 2 <= cx1 + BIN
             )
-            if n_blk >= 2:
+            # Allow single-block columns if the block is wide enough
+            # (e.g. a Table of Contents filling the entire left half)
+            col_width_pct = (cx1 - cx0) / page_width
+            if n_blk >= 2 or (n_blk >= 1 and col_width_pct >= 0.25):
                 valid_gap.append((cx0, cx1))
 
         if 2 <= len(valid_gap) <= 6:
@@ -519,6 +521,75 @@ class RapidDocEngine:
             return len(valid_cx), valid_cx
 
         return 1, []
+
+    @staticmethod
+    def analyze_layout(
+        block_bboxes: List[Dict[str, Any]],
+        page_size: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Analyze spatial layout of blocks for rendering hints.
+
+        Returns a dict with:
+        - 'centered': True if most blocks are horizontally centered
+        - 'sparse': True if few blocks with lots of vertical whitespace
+        - 'content_y_range': (y_min, y_max) of all content blocks
+        - 'avg_block_center_x_pct': average center-x as % of page width
+        """
+        result = {
+            'centered': False,
+            'sparse': False,
+            'content_y_range': None,
+            'avg_block_center_x_pct': 0.5,
+        }
+
+        if not block_bboxes:
+            return result
+
+        CONTENT_TYPES = ('text', 'title', 'paragraph_title', 'list')
+        content_blocks = [
+            b for b in block_bboxes
+            if b.get('type') in CONTENT_TYPES
+        ]
+        if not content_blocks:
+            return result
+
+        pw = page_size[0] if page_size else 1.0
+        ph = page_size[1] if page_size else 1.0
+
+        # Calculate center-x and y-range for each content block
+        centers_x_pct = []
+        y_min = ph
+        y_max = 0.0
+        total_text_height = 0.0
+
+        for b in content_blocks:
+            x0, y0, x1, y1 = b['bbox']
+            cx_pct = (x0 + x1) / 2 / pw if pw > 0 else 0.5
+            centers_x_pct.append(cx_pct)
+            y_min = min(y_min, y0)
+            y_max = max(y_max, y1)
+            total_text_height += (y1 - y0)
+
+        avg_cx_pct = sum(centers_x_pct) / len(centers_x_pct)
+        result['avg_block_center_x_pct'] = avg_cx_pct
+        result['content_y_range'] = (y_min, y_max)
+
+        # Centered: average center within 40-60% of page width,
+        # and no block extends past 80% or before 20%
+        all_within = all(
+            0.15 < cx < 0.85 for cx in centers_x_pct
+        )
+        if all_within and 0.40 <= avg_cx_pct <= 0.60:
+            result['centered'] = True
+
+        # Sparse: few content blocks and text covers < 30% of page height
+        if len(content_blocks) <= 8 and ph > 0:
+            text_coverage = total_text_height / ph
+            if text_coverage < 0.30:
+                result['sparse'] = True
+
+        return result
 
 
 def check_rapiddoc_status() -> Tuple[bool, str]:

@@ -11,7 +11,6 @@ Versioning follows Semantic Versioning (SemVer): MAJOR.MINOR.PATCH
 
 Pre-release tags: alpha, beta, rc (release candidate)
 """
-from datetime import datetime
 from typing import Dict, Any
 
 # ============================================
@@ -19,12 +18,12 @@ from typing import Dict, Any
 # ============================================
 
 VERSION_MAJOR = 1
-VERSION_MINOR = 0
+VERSION_MINOR = 1
 VERSION_PATCH = 0
 VERSION_PRERELEASE = ""  # e.g., "alpha", "beta", "rc.1", or "" for stable
 
 # Build metadata (auto-generated or set by CI/CD)
-BUILD_DATE = "2026-03-05"
+BUILD_DATE = "2026-03-09"
 BUILD_NUMBER = ""  # Set by CI/CD pipeline, e.g., "1234"
 
 

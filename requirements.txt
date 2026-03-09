@@ -7,9 +7,8 @@ PyMuPDF>=1.24.0
 # Image processing for OCR
 Pillow>=10.0.0
 
-# World-class translation: NLLB-200 distilled-600M
+# Translation: Helsinki-NLP OPUS-MT via transformers + torch
 transformers>=4.40.0
-sentencepiece>=0.2.0
 torch>=2.0.0
 sacremoses>=0.1.0
 

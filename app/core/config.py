@@ -11,7 +11,7 @@ OCR Engine: RapidOCR v3 (ONNX Runtime)
 - Configurazione in app/core/rapid_ocr.py
 """
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict
 
 
 # ============================================
@@ -125,22 +125,6 @@ SERIF_FONT_PATTERNS = [
 # Language Mappings
 # ============================================
 
-# OPUS-MT model mapping
-OPUS_MODEL_MAP: Dict[Tuple[str, str], str] = {
-    ("en", "it"): "Helsinki-NLP/opus-mt-en-it",
-    ("it", "en"): "Helsinki-NLP/opus-mt-it-en",
-    ("en", "es"): "Helsinki-NLP/opus-mt-en-es",
-    ("es", "en"): "Helsinki-NLP/opus-mt-es-en",
-    ("en", "fr"): "Helsinki-NLP/opus-mt-en-fr",
-    ("fr", "en"): "Helsinki-NLP/opus-mt-fr-en",
-    ("en", "de"): "Helsinki-NLP/opus-mt-en-de",
-    ("de", "en"): "Helsinki-NLP/opus-mt-de-en",
-    ("en", "pt"): "Helsinki-NLP/opus-mt-en-roa",
-    ("pt", "en"): "Helsinki-NLP/opus-mt-roa-en",
-    ("en", "nl"): "Helsinki-NLP/opus-mt-en-nl",
-    ("nl", "en"): "Helsinki-NLP/opus-mt-nl-en",
-}
-
 SUPPORTED_LANGUAGES: Dict[str, str] = {
     "Italiano": "it",
     "English": "en",
@@ -155,17 +139,6 @@ SUPPORTED_LANGUAGES: Dict[str, str] = {
 # ============================================
 # Text Normalization Maps
 # ============================================
-
-# Ligature replacements for PDF rendering
-LIGATURE_MAP: Dict[str, str] = {
-    '\ufb00': 'ff',
-    '\ufb01': 'fi',
-    '\ufb02': 'fl',
-    '\ufb03': 'ffi',
-    '\ufb04': 'ffl',
-    '\ufb05': 'ft',
-    '\ufb06': 'st',
-}
 
 # Typographic quotes to standard
 QUOTE_MAP: Dict[str, str] = {
@@ -191,24 +164,6 @@ DASH_SPACE_MAP: Dict[str, str] = {
     '\u2003': ' ',  # Em space
     '\u2002': ' ',  # En space
     '\u2009': ' ',  # Thin space
-}
-
-
-# ============================================
-# Abbreviations (for sentence splitting)
-# ============================================
-
-ABBREVIATIONS = {
-    # English
-    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc', 'inc', 'ltd',
-    'fig', 'vol', 'no', 'pp', 'ed', 'eds', 'rev', 'col', 'gen', 'gov',
-    'hon', 'lt', 'sgt', 'rep', 'sen', 'st', 'co', 'corp', 'dept', 'div',
-    # Italian
-    'dott', 'sig', 'sig.ra', 'prof', 'avv', 'ing', 'arch', 'geom',
-    # German
-    'nr', 'str', 'tel', 'bzw',
-    # French
-    'av', 'bd', 'env', 'm', 'mme', 'mlle',
 }
 
 

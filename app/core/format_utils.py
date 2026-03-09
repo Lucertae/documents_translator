@@ -4,42 +4,53 @@ Text formatting utilities for PDF translation.
 Functions for mapping original formatting to translated text,
 HTML generation, and text normalization.
 """
-import re
+import unicodedata
+from functools import partial
+from html import escape as _html_escape
 from typing import List, Tuple, Optional, Dict
 
+# Don't escape single quotes — Italian text is full of apostrophes (l'accordo, c'è, dell'Italia)
+# The original custom escape_html only escaped &, <, >, " — NOT '
+escape_html = partial(_html_escape, quote=False)
+
 from .formatting import SpanFormat
-from .config import LIGATURE_MAP, QUOTE_MAP, DASH_SPACE_MAP
+from .config import QUOTE_MAP, DASH_SPACE_MAP
 
 
-def escape_html(text: str) -> str:
-    """Escape HTML special characters."""
-    return (text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;"))
-
-
-def normalize_text_for_pdf(text: str) -> str:
+def normalize_text_for_pdf(text: str, is_ocr: bool = True) -> str:
     """
     Normalize text for proper PDF rendering.
     
     Handles:
-    - Unicode ligatures (fi, fl, ff, ffi, ffl) → individual chars
-    - Typographic quotes → standard quotes
-    - Special dashes → standard dashes
+    - Unicode ligatures (fi, fl, ff, ffi, ffl) → individual chars (always)
+    - Typographic quotes → standard quotes (OCR only)
+    - Special dashes → standard dashes (OCR only)
+    
+    For native digital PDF text, we preserve typographic characters
+    like «», –, — since they are intentional in the source document.
+    For OCR text, we normalize everything since OCR may introduce
+    inconsistent Unicode characters.
+    
+    Args:
+        text: Text to normalize
+        is_ocr: If True, apply full normalization (OCR output).
+                If False, only normalize ligatures (native PDF text).
     """
     if not text:
         return text
     
-    for old, new in LIGATURE_MAP.items():
-        text = text.replace(old, new)
+    # NFKC normalizes ligatures (ﬁ→fi, ﬂ→fl, etc.), ellipsis (…→...),
+    # and special spaces (NBSP, en/em/thin space → regular space).
+    # Safe for all text: does NOT alter quotes, dashes, or accented letters.
+    text = unicodedata.normalize('NFKC', text)
     
-    for old, new in QUOTE_MAP.items():
-        text = text.replace(old, new)
-    
-    for old, new in DASH_SPACE_MAP.items():
-        text = text.replace(old, new)
+    if is_ocr:
+        # Additional OCR normalization: quotes and dashes
+        for old, new in QUOTE_MAP.items():
+            text = text.replace(old, new)
+        
+        for old, new in DASH_SPACE_MAP.items():
+            text = text.replace(old, new)
     
     return text
 
@@ -266,46 +277,3 @@ def _merge_adjacent_formats(
     merged.append((current_text, current_fmt))
     return merged
 
-
-def detect_title_or_heading(
-    line_avg_size: float,
-    overall_avg_size: float,
-    is_bold: bool,
-    text: str
-) -> bool:
-    """
-    Detect if a line is likely a title or heading.
-    
-    Heuristics:
-    - Larger font size than average
-    - Bold formatting
-    - All caps or title case
-    - Short length
-    - No ending punctuation
-    """
-    indicators = 0
-    
-    # Larger font (at least 20% bigger)
-    if line_avg_size > overall_avg_size * 1.2:
-        indicators += 2
-    
-    # Bold
-    if is_bold:
-        indicators += 1
-    
-    # Short text
-    if len(text) < 60:
-        indicators += 1
-    
-    # All caps or Title Case
-    text = text.strip()
-    if text.isupper() and len(text) > 3:
-        indicators += 2
-    elif text.istitle() and len(text.split()) <= 8:
-        indicators += 1
-    
-    # No ending punctuation
-    if text and text[-1] not in '.!?;:':
-        indicators += 1
-    
-    return indicators >= 3
