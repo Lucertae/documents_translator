@@ -25,7 +25,6 @@ from .format_utils import (
     map_formatting_to_translation,
     normalize_text_for_pdf,
     escape_html,
-    detect_title_or_heading,
 )
 from .sentry_integration import (
     init_sentry,
@@ -59,7 +58,6 @@ __all__ = [
     'map_formatting_to_translation',
     'normalize_text_for_pdf',
     'escape_html',
-    'detect_title_or_heading',
     # Sentry
     'init_sentry',
     'capture_exception',
