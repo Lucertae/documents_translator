@@ -19,11 +19,11 @@ from typing import Dict, Any
 
 VERSION_MAJOR = 1
 VERSION_MINOR = 1
-VERSION_PATCH = 0
+VERSION_PATCH = 1
 VERSION_PRERELEASE = ""  # e.g., "alpha", "beta", "rc.1", or "" for stable
 
 # Build metadata (auto-generated or set by CI/CD)
-BUILD_DATE = "2026-03-09"
+BUILD_DATE = "2026-03-10"
 BUILD_NUMBER = ""  # Set by CI/CD pipeline, e.g., "1234"
 
 
