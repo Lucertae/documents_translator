@@ -19,8 +19,9 @@ binaries = []
 # Collect all necessary data files
 datas = []
 
-# PySide6 resources
+# PySide6 resources + dynamic libraries (DLL/pyd)
 datas += collect_data_files('PySide6', include_py_files=False)
+binaries += collect_dynamic_libs('PySide6')
 
 # Transformers models (NLLB) - Note: models are downloaded at runtime
 datas += collect_data_files('transformers', include_py_files=False)
@@ -182,6 +183,17 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=[
+        # UPX corrompe le DLL di Qt6 — escluderle sempre
+        'Qt6*.dll',
+        'Qt6*.pyd',
+        'pyside6*.dll',
+        'pyside6*.pyd',
+        'shiboken6*.dll',
+        'shiboken6*.pyd',
+        # Anche OpenVINO e ONNX Runtime possono avere problemi
+        'openvino*.dll',
+        'onnxruntime*.dll',
+    ],
     name='lac-translate',
 )
