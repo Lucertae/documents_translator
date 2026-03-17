@@ -10,7 +10,7 @@
 ; ==========================================================================
 
 #define MyAppName      "LAC Translate"
-#define MyAppVersion   "1.2.0"
+#define MyAppVersion   "1.2.1"
 #define MyAppPublisher "LUCERTAE SRLS"
 #define MyAppExeName   "lac-translate.exe"
 #define MyAppURL       "https://github.com/Lucertae/documents_translator"
