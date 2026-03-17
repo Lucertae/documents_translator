@@ -69,15 +69,39 @@ jobs:
             exit 1
           }
 
-      - name: Create ZIP archive
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y --no-progress
+          # Verifica installazione
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /? | Select-Object -First 1
+
+      - name: Build installer with Inno Setup
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          if (Test-Path "dist/LAC-Translate-Setup-*.exe") {
+            $installer = Get-ChildItem "dist/LAC-Translate-Setup-*.exe"
+            Write-Host "✅ Installer creato: $($installer.Name) ($([math]::Round($installer.Length / 1MB, 2)) MB)"
+          } else {
+            Write-Host "❌ Errore: installer non trovato"
+            exit 1
+          }
+
+      - name: Create ZIP archive (standalone)
         run: |
           Compress-Archive -Path "dist/lac-translate/*" -DestinationPath "lac-translate-windows.zip"
 
-      - name: Upload Windows artifact
+      - name: Upload Windows standalone artifact
         uses: actions/upload-artifact@v4
         with:
           name: lac-translate-windows
           path: lac-translate-windows.zip
+          retention-days: 30
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lac-translate-installer
+          path: dist/LAC-Translate-Setup-*.exe
           retention-days: 30
 
   # ===========================================
@@ -95,10 +119,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download Windows artifact
+      - name: Download Windows standalone artifact
         uses: actions/download-artifact@v4
         with:
           name: lac-translate-windows
+
+      - name: Download Windows installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lac-translate-installer
 
       - name: Get version from tag
         id: version
@@ -111,25 +140,27 @@ jobs:
           body: |
             ## LAC Translate ${{ steps.version.outputs.VERSION }}
             
-            Professional PDF Translator with NLLB-200 and RapidDoc OCR.
+            Traduttore professionale di PDF con OPUS-MT e RapidDoc OCR.
             
-            ### Downloads
-            - **Windows**: `lac-translate-windows.zip` - Extract and run `lac-translate.exe`
+            ### Download
+            - **Installer (consigliato)**: `LAC-Translate-Setup-*.exe` — doppio click, installa tutto, crea collegamenti
+            - **Standalone (ZIP)**: `lac-translate-windows.zip` — estrai e avvia `lac-translate.exe`
             
-            ### Requirements
+            ### Requisiti
             - Windows 10/11
-            - 8GB+ RAM recommended
-            - Internet connection for first-time model download (~1.5 GB)
+            - 8 GB+ RAM consigliati
+            - Connessione internet al primo avvio (scarica il modello di traduzione, ~300 MB)
             
-            ### What's New in v1.0.0
-            - Multi-column layout detection (2/3/4+ columns)
-            - Story API rendering with real column positions
-            - Bilingual side-by-side document support
-            - RapidDoc structured extraction (PP-DocLayoutV2 + RapidOCR)
-            - NLLB-200 distilled-600M translation engine
-            - Full audit: 17/17 pages OK, 0 issues
+            ### Novità in ${{ steps.version.outputs.VERSION }}
+            - Splash screen con barra di progresso durante l'avvio
+            - Installer Windows (Inno Setup) — installazione/disinstallazione pulita
+            - Fix caricamento DLL Qt6
+            - Rilevamento colonne multi-layout (2/3/4+)
+            - Supporto documenti bilingue affiancati
+            - Estrazione strutturata RapidDoc (PP-DocLayoutV2 + RapidOCR)
           files: |
             lac-translate-windows.zip
+            LAC-Translate-Setup-*.exe
           draft: false
           prerelease: false
         env:
