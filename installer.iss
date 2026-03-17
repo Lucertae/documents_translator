@@ -64,7 +64,7 @@ Name: "english";   MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon";  Description: "Crea un'icona sul &Desktop";  GroupDescription: "Icone aggiuntive:"; Flags: unchecked
-Name: "startmenu";    Description: "Crea un collegamento nel menu &Start"; GroupDescription: "Icone aggiuntive:"; Flags: checked
+Name: "startmenu";    Description: "Crea un collegamento nel menu &Start"; GroupDescription: "Icone aggiuntive:";
 
 [Files]
 ; Tutta la cartella di output di PyInstaller
